@@ -37,6 +37,15 @@ export async function handler({
     const take = boundedLimit(limit, 20);
     const results = all.slice(offset, offset + take);
     const nextOffset = offset + results.length;
+
+    // On zero results, offer "did you mean" corrections token by token
+    let suggestion: string | null = null;
+    if (all.length === 0 && types.includes("file")) {
+        const tokens = query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+        const corrected = tokens.map((token) => knowledgeIndex.suggestCorrection(token) ?? token);
+        if (corrected.some((c, i) => c !== tokens[i])) suggestion = corrected.join(" ");
+    }
+
     return {
         content: [
             {
@@ -47,6 +56,7 @@ export async function handler({
                     total: all.length,
                     results,
                     next_cursor: nextOffset < all.length ? encodeCursor(nextOffset) : null,
+                    suggestion,
                 }),
             },
         ],

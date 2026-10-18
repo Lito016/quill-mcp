@@ -210,6 +210,10 @@ class MetadataIndexImpl {
     async updateEntry(filePath: string): Promise<void> {
         const vaultRoot = getVaultRoot();
         await this.indexFile(filePath, vaultRoot);
+        // Recompute aggregate BM25 stats after incremental update
+        const lengths = [...this.invertedIndex.docLengths.values()];
+        this.invertedIndex.avgDocLength = lengths.length > 0 ? lengths.reduce((a, b) => a + b, 0) / lengths.length : 0;
+        this.invertedIndex.docCount = this.memories.size;
         this.stale = false;
     }
 
@@ -332,6 +336,7 @@ class MetadataIndexImpl {
         const config = getConfig();
         const skipDirs = new Set([
             ".trash",
+            ".versions",
             ".quill-sessions",
             ".quill",
             "node_modules",

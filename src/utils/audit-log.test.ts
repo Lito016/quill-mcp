@@ -57,6 +57,8 @@ describe("Audit Log", () => {
                 action: "create",
                 newState: { status: "ACTIVE" },
             });
+            // Space writes apart so timestamps differ beyond ms resolution
+            await new Promise((resolve) => setTimeout(resolve, 2));
             await logAuditEntry({
                 actor: "user",
                 memoryId: "mem_002",
@@ -102,19 +104,22 @@ describe("Audit Log", () => {
 
     describe("queryAuditLog", () => {
         beforeEach(async () => {
-            // Seed test data
+            // Seed test data; space writes apart so timestamps differ beyond ms resolution
+            const tick = () => new Promise((resolve) => setTimeout(resolve, 2));
             await logAuditEntry({
                 actor: "agent",
                 memoryId: "mem_alpha",
                 action: "create",
                 newState: { status: "ACTIVE" },
             });
+            await tick();
             await logAuditEntry({
                 actor: "user",
                 memoryId: "mem_beta",
                 action: "update",
                 newState: { confidence: 0.9 },
             });
+            await tick();
             await logAuditEntry({
                 actor: "agent",
                 memoryId: "mem_alpha",
@@ -122,6 +127,7 @@ describe("Audit Log", () => {
                 previousState: { status: "ACTIVE" },
                 newState: { status: "CONFIRMED" },
             });
+            await tick();
             await logAuditEntry({
                 actor: "system",
                 memoryId: "mem_gamma",

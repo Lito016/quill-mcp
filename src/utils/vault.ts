@@ -1,18 +1,177 @@
 import { resolve, relative, isAbsolute, join, dirname, normalize } from "node:path";
-import { access, stat, realpath, lstat, readdir, readFile } from "node:fs/promises";
+import { access, stat, realpath, lstat, readdir, readFile, open, writeFile as fsWriteFile, rename } from "node:fs/promises";
 import { constants, readFileSync, existsSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { config as loadDotenv } from "dotenv";
 import { fileURLToPath } from "node:url";
 import { logger } from "./logger.js";
+import { invalidateVaultPath } from "./index-invalidation.js";
 
 /** Directories that must never be deleted/modified by any tool. */
-const PROTECTED_DIRS = new Set([".trash", ".git", ".quill-sessions", "node_modules"]);
+const PROTECTED_DIRS = new Set([".trash", ".versions", ".git", ".quill-sessions", "node_modules"]);
 
 /** Whether the current platform is case-insensitive (Windows, macOS). */
 const IS_CASE_INSENSITIVE = platform() === "win32" || platform() === "darwin";
 
+/** Max entries in the LRU read cache. */
+const CACHE_MAX_SIZE = 128;
+
 let vaultRoot: string;
+
+// ─── LRU Read Cache ───────────────────────────────────────────────────
+
+/**
+ * Simple LRU cache for file contents.
+ * Uses a Map (which preserves insertion order) for O(1) get/set/delete.
+ * On cache hit, the entry is deleted and re-inserted to move it to the end (most-recent).
+ * When the cache exceeds CACHE_MAX_SIZE, the oldest entry (first key) is evicted.
+ */
+const readCache = new Map<string, string>();
+
+// Cache statistics
+let cacheHits = 0;
+let cacheMisses = 0;
+let cacheEvictions = 0;
+let bytesCached = 0;
+
+/**
+ * Get cache statistics for monitoring and benchmarking.
+ */
+export function getCacheStats(): {
+    size: number;
+    maxSize: number;
+    hits: number;
+    misses: number;
+    evictions: number;
+    bytesCached: number;
+    hitRate: number;
+} {
+    const total = cacheHits + cacheMisses;
+    return {
+        size: readCache.size,
+        maxSize: CACHE_MAX_SIZE,
+        hits: cacheHits,
+        misses: cacheMisses,
+        evictions: cacheEvictions,
+        bytesCached,
+        hitRate: total > 0 ? cacheHits / total : 0,
+    };
+}
+
+/**
+ * Reset cache statistics counters.
+ */
+export function resetCacheStats(): void {
+    cacheHits = 0;
+    cacheMisses = 0;
+    cacheEvictions = 0;
+    bytesCached = 0;
+}
+
+/**
+ * Read a file with LRU caching. Returns cached content if available.
+ * Cache key is the absolute path. Invalidated by invalidateReadCache().
+ */
+export async function cachedReadFile(absolutePath: string): Promise<string> {
+    const cached = readCache.get(absolutePath);
+    if (cached !== undefined) {
+        // Move to end (most recently used)
+        readCache.delete(absolutePath);
+        readCache.set(absolutePath, cached);
+        cacheHits++;
+        return cached;
+    }
+    cacheMisses++;
+    const content = await readFile(absolutePath, "utf-8");
+    readCache.set(absolutePath, content);
+    bytesCached += Buffer.byteLength(content, "utf-8");
+    if (readCache.size > CACHE_MAX_SIZE) {
+        // Evict oldest entry (first key in Map iteration order)
+        const oldest = readCache.keys().next().value;
+        if (oldest !== undefined) {
+            const oldestContent = readCache.get(oldest);
+            if (oldestContent) {
+                bytesCached -= Buffer.byteLength(oldestContent, "utf-8");
+            }
+            readCache.delete(oldest);
+            cacheEvictions++;
+        }
+    }
+    return content;
+}
+
+/**
+ * Invalidate the read cache for a specific path, or the entire cache if no path given.
+ * Must be called after every write/delete/move to prevent stale reads.
+ *
+ * ## External Edit Consistency Policy
+ *
+ * The LRU read cache is keyed by absolute path. It does NOT track file modification
+ * times or inode numbers. This means:
+ *
+ * 1. **Internal writes** (via quill-mcp tools): All write paths call `invalidateReadCache(path)`
+ *    immediately after writing, ensuring subsequent reads return fresh content.
+ *
+ * 2. **External edits** (by user, editor, or another process): The cache will serve
+ *    stale content until `invalidateReadCache(path)` or `invalidateReadCache()` (global)
+ *    is called. This is a deliberate trade-off: we avoid the syscall overhead of
+ *    stat-checking every cached file on every read.
+ *
+ * 3. **When to invalidate**: If your application allows external edits to vault files,
+ *    you must call `invalidateReadCache()` before the next read cycle, or use
+ *    `invalidateReadCache(path)` for specific files known to have changed.
+ *
+ * 4. **Safety**: The cache never serves content that was not successfully persisted
+ *    by an internal write. Failed writes do not populate the cache.
+ */
+export function invalidateReadCache(absolutePath?: string): void {
+    if (absolutePath) {
+        const content = readCache.get(absolutePath);
+        if (content) {
+            bytesCached -= Buffer.byteLength(content, "utf-8");
+        }
+        readCache.delete(absolutePath);
+    } else {
+        readCache.clear();
+        bytesCached = 0;
+    }
+}
+
+/**
+ * Read only the last N bytes of a file. Useful for checking trailing newlines
+ * without loading the entire file into memory.
+ */
+export async function tailReadFile(absolutePath: string, bytes: number): Promise<string> {
+    let fh;
+    try {
+        fh = await open(absolutePath, "r");
+        const { size } = await fh.stat();
+        const start = Math.max(0, size - bytes);
+        const buf = Buffer.alloc(Math.min(bytes, size));
+        await fh.read(buf, 0, buf.length, start);
+        return buf.toString("utf-8");
+    } finally {
+        await fh?.close();
+    }
+}
+
+// ─── Cached realpath ──────────────────────────────────────────────────
+
+/** Cached realpath of the vault root to avoid repeated syscalls. */
+let cachedVaultReal: string | null = null;
+
+/** Get the cached realpath of the vault root. Resolves and caches on first call. */
+async function getVaultReal(): Promise<string> {
+    if (cachedVaultReal === null) {
+        cachedVaultReal = await realpath(vaultRoot);
+    }
+    return cachedVaultReal;
+}
+
+/** Invalidate the cached vault realpath (call when vault root changes). */
+function invalidateVaultReal(): void {
+    cachedVaultReal = null;
+}
 
 /**
  * Resolve the vault path from available configuration sources.
@@ -73,9 +232,9 @@ function resolveVaultRoot(): string {
             '(3) Config: vault.config.json → { "vaultPath": "/path/to/vault" } ' +
             "(4) .env: NOTES_VAULT_PATH=/path/to/vault",
     );
-    // Keep the original console.error for startup failure visibility:
-    console.error(
-        "Error: No vault path configured.\n\n" +
+    // Throw instead of exit so caller can handle gracefully
+    throw new Error(
+        "No vault path configured.\n\n" +
             "Set your vault path using one of these methods:\n" +
             "  1. CLI argument:   node dist/index.js /path/to/vault\n" +
             "  2. Environment:    set NOTES_VAULT_PATH=/path/to/vault\n" +
@@ -83,7 +242,6 @@ function resolveVaultRoot(): string {
             "  4. .env file:      add NOTES_VAULT_PATH=/path/to/vault to a .env file\n\n" +
             "Quick start: Edit vault.config.json and set your vault path.\n",
     );
-    process.exit(1);
 }
 
 /**
@@ -132,6 +290,8 @@ function getProjectRoot(): string {
  */
 export function initVault(): string {
     vaultRoot = resolveVaultRoot();
+    invalidateVaultReal();
+    invalidateReadCache();
     return vaultRoot;
 }
 
@@ -164,7 +324,7 @@ export function resolveVaultPath(relativePath: string): string {
  * Use this for read/delete operations on paths that must exist.
  */
 export async function assertWithinVault(absolutePath: string): Promise<void> {
-    const vaultReal = await realpath(vaultRoot);
+    const vaultReal = await getVaultReal();
     const targetReal = await realpath(absolutePath);
     const rel = relative(vaultReal, targetReal);
     if (rel.startsWith("..") || isAbsolute(rel)) {
@@ -177,18 +337,26 @@ export async function assertWithinVault(absolutePath: string): Promise<void> {
  * existing ancestor and verify its canonical path is within the vault.
  */
 export async function assertParentWithinVault(absolutePath: string): Promise<void> {
-    const vaultReal = await realpath(vaultRoot);
+    const vaultReal = await getVaultReal();
     let current = dirname(absolutePath);
     while (current !== dirname(current)) {
-        if (existsSync(current)) {
+        try {
+            await stat(current);
+            // Path exists — verify canonical containment
             const real = await realpath(current);
             const rel = relative(vaultReal, real);
             if (rel.startsWith("..") || isAbsolute(rel)) {
-                throw new Error(`Path traversal blocked: parent of "${absolutePath}" resolves outside the vault.`);
+                throw new Error(`Path traversal blocked: parent of "${absolutePath}" resolves (via symlink) outside the vault.`);
             }
             return;
+        } catch (err: unknown) {
+            // Re-throw path traversal errors
+            if (err instanceof Error && err.message.includes("Path traversal")) {
+                throw err;
+            }
+            // stat() failed — directory doesn't exist, walk up
+            current = dirname(current);
         }
-        current = dirname(current);
     }
 }
 
@@ -254,6 +422,8 @@ export async function safeWriteTarget(relativePath: string): Promise<string> {
     } else {
         await assertParentWithinVault(fullPath);
     }
+    // Schedule a precise search-index refresh for the next sync (see index-invalidation.ts)
+    invalidateVaultPath(relative(vaultRoot, fullPath).replace(/\\/g, "/"));
     return fullPath;
 }
 
@@ -268,6 +438,8 @@ export async function safeDeleteTarget(relativePath: string): Promise<string> {
     if (await pathExists(fullPath)) {
         await assertWithinVault(fullPath);
     }
+    // Schedule a precise search-index refresh for the next sync (see index-invalidation.ts)
+    invalidateVaultPath(relative(vaultRoot, fullPath).replace(/\\/g, "/"));
     return fullPath;
 }
 
@@ -300,14 +472,21 @@ export async function safeInternalPath(relativeDir: string): Promise<string> {
         throw new Error(`Configuration error: internal path "${relativeDir}" resolves outside the vault.`);
     }
     // Canonical check if path exists
-    if (existsSync(fullPath)) {
-        const vaultReal = await realpath(vaultRoot);
+    try {
+        await access(fullPath, constants.F_OK);
+        const vaultReal = await getVaultReal();
         const targetReal = await realpath(fullPath);
         const realRel = relative(vaultReal, targetReal);
         if (realRel.startsWith("..") || isAbsolute(realRel)) {
             throw new Error(
                 `Configuration error: internal path "${relativeDir}" resolves (via symlink) outside the vault.`,
             );
+        }
+    } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+            // Path doesn't exist — that's fine for internal paths
+        } else if (err instanceof Error && err.message.includes("Configuration error")) {
+            throw err;
         }
     }
     return fullPath;
@@ -454,4 +633,23 @@ export async function getPathStats(filePath: string): Promise<{
         created: s.birthtime.toISOString(),
         modified: s.mtime.toISOString(),
     };
+}
+
+/**
+ * Write a file atomically by writing to a temp file first, then renaming.
+ * This prevents partial writes from being visible if the process crashes
+ * or if two agents write to the same file simultaneously.
+ * The rename operation is atomic on most filesystems.
+ *
+ * NOTE: Most tools use direct writeFile() which is sufficient for single-agent
+ * use. Use atomicWriteFile() when concurrent writers are expected.
+ */
+export async function atomicWriteFile(
+    targetPath: string,
+    content: string,
+    encoding: BufferEncoding = "utf-8",
+): Promise<void> {
+    const tmpPath = `${targetPath}.tmp.${process.pid}.${Date.now()}`;
+    await fsWriteFile(tmpPath, content, encoding);
+    await rename(tmpPath, targetPath);
 }

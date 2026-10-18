@@ -1,8 +1,13 @@
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { extname } from "node:path";
-import { pathExists, safeWriteTarget } from "../utils/vault.js";
+import { pathExists, safeWriteTarget, invalidateReadCache, tailReadFile } from "../utils/vault.js";
+import { invalidateGraphCache } from "../utils/graph-cache.js";
 import { scheduleHiveRegen } from "./hive-auto-regen.js";
 import { validateContentSize } from "../utils/errors.js";
+import { pushUndo } from "../utils/undo-stack.js";
+import { saveVersion } from "../utils/version-store.js";
+import { invalidateVersionCache } from "../utils/version-index.js";
+import { eventBus } from "../utils/event-bus.js";
 import * as z from "zod";
 
 export const name = "append_note";
@@ -22,6 +27,10 @@ export const inputSchema = z.object({
         .boolean()
         .default(true)
         .describe("If true, ensure proper newline separation before/after appended content"),
+    skip_version: z
+        .boolean()
+        .default(false)
+        .describe("If true, skip saving a version snapshot before appending (default: false)"),
 });
 
 export async function handler({
@@ -31,6 +40,7 @@ export async function handler({
     after_heading,
     before_heading,
     auto_newline,
+    skip_version,
 }: {
     path: string;
     content: string;
@@ -38,6 +48,7 @@ export async function handler({
     after_heading?: string;
     before_heading?: string;
     auto_newline: boolean;
+    skip_version: boolean;
 }) {
     // Validate content size
     const sizeError = validateContentSize(content);
@@ -112,9 +123,22 @@ export async function handler({
         }
 
         lines.splice(insertIndex, 0, insertContent);
+        pushUndo(fullPath, fullContent, `append_note section edit`);
+        if (!skip_version) {
+            await saveVersion({ sourcePath: resolvedPath, content: fullContent, reason: "append_note section edit" });
+        }
         await writeFile(fullPath, lines.join("\n"), "utf-8");
+        invalidateReadCache(fullPath);
+        if (!skip_version) invalidateVersionCache(resolvedPath);
+        invalidateGraphCache();
         scheduleHiveRegen(resolvedPath);
         const location = after_heading ? `after heading "${after_heading}"` : `before heading "${before_heading}"`;
+        eventBus.emitAsync({
+            type: "note_updated",
+            path: resolvedPath,
+            timestamp: new Date().toISOString(),
+            metadata: { operation: after_heading ? "insert_after_heading" : "insert_before_heading" },
+        });
         return { content: [{ type: "text" as const, text: `Content inserted ${location} in "${resolvedPath}".` }] };
     }
 
@@ -126,16 +150,35 @@ export async function handler({
             if (!insertContent.endsWith("\n")) insertContent += "\n";
             if (!existing.startsWith("\n")) insertContent += "\n";
         }
+        pushUndo(fullPath, existing, `append_note prepend`);
+        if (!skip_version) {
+            await saveVersion({ sourcePath: resolvedPath, content: existing, reason: "append_note prepend" });
+        }
         await writeFile(fullPath, insertContent + existing, "utf-8");
+        invalidateReadCache(fullPath);
+        if (!skip_version) invalidateVersionCache(resolvedPath);
+        invalidateGraphCache();
         scheduleHiveRegen(resolvedPath);
+        eventBus.emitAsync({
+            type: "note_updated",
+            path: resolvedPath,
+            timestamp: new Date().toISOString(),
+            metadata: { operation: "prepend" },
+        });
         return { content: [{ type: "text" as const, text: `Content prepended to "${resolvedPath}".` }] };
     }
 
-    // Normal append (with auto-newline)
+    // Normal append (with auto-newline) — use tail-read instead of full-file read
+    // Save undo snapshot
+    const preAppendContent = await readFile(fullPath, "utf-8");
+    pushUndo(fullPath, preAppendContent, `append_note append`);
+    if (!skip_version) {
+        await saveVersion({ sourcePath: resolvedPath, content: preAppendContent, reason: "append_note append" });
+    }
     if (auto_newline) {
-        const existing = await readFile(fullPath, "utf-8");
+        const tail = await tailReadFile(fullPath, 2);
         let separator = "";
-        if (existing.length > 0 && !existing.endsWith("\n")) {
+        if (tail.length > 0 && !tail.endsWith("\n")) {
             separator = "\n";
         }
         let insertContent = content;
@@ -147,7 +190,16 @@ export async function handler({
         await appendFile(fullPath, content, "utf-8");
     }
 
+    invalidateReadCache(fullPath);
+    if (!skip_version) invalidateVersionCache(resolvedPath);
+    invalidateGraphCache();
     scheduleHiveRegen(resolvedPath);
+    eventBus.emitAsync({
+        type: "note_updated",
+        path: resolvedPath,
+        timestamp: new Date().toISOString(),
+        metadata: { operation: "append" },
+    });
     return { content: [{ type: "text" as const, text: `Content appended to "${resolvedPath}".` }] };
 }
 

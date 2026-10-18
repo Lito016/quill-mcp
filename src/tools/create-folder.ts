@@ -2,6 +2,7 @@
 import { pathExists, safeWriteTarget } from "../utils/vault.js";
 import * as z from "zod";
 import { scheduleHiveRegen } from "./hive-auto-regen.js";
+import { eventBus } from "../utils/event-bus.js";
 
 export const name = "create_folder";
 export const description = "Create a new folder in the vault. Creates parent directories if needed.";
@@ -18,5 +19,11 @@ export async function handler({ path }: { path: string }) {
 
     await mkdir(fullPath, { recursive: true });
     scheduleHiveRegen(path);
+    eventBus.emitAsync({
+        type: "folder_created",
+        path,
+        timestamp: new Date().toISOString(),
+        metadata: {},
+    });
     return { content: [{ type: "text" as const, text: `Folder created: "${path}".` }] };
 }

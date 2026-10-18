@@ -67,7 +67,7 @@ export async function scanVaultNotes(
     async function scanDir(dir: string) {
         const items = await readdir(dir, { withFileTypes: true });
         for (const item of items) {
-            if (item.name === ".trash" || item.name === ".quill-sessions") continue;
+            if (item.name === ".trash" || item.name === ".quill-sessions" || item.name === ".versions") continue;
             const fullPath = `${dir}/${item.name}`;
             // Symlink defense: never recurse into symbolic links
             const entryStat = await lstat(fullPath);
@@ -425,5 +425,157 @@ export function graphStats(nodes: VaultNode[], edges: VaultEdge[]) {
         wikiLinks,
         markdownLinks,
         sharedTagLinks,
+    };
+}
+
+// --- K-hop neighborhood ---
+
+export interface NeighborhoodNote {
+    id: string;
+    path: string;
+    tags: string[];
+    /** How this note connects to the center note */
+    connection: {
+        type: "backlink" | "outgoing" | "shared-tags";
+        /** The edge type (wiki, markdown, shared-tags) */
+        edgeType: string;
+        /** For shared-tags, the tags in common */
+        sharedTags?: string[];
+        /** Hop distance from center (1 = direct, 2 = neighbor-of-neighbor) */
+        hop: number;
+    };
+}
+
+export interface NeighborhoodResult {
+    center: { id: string; path: string; tags: string[] };
+    neighbors: NeighborhoodNote[];
+    stats: {
+        totalNeighbors: number;
+        backlinks: number;
+        outgoing: number;
+        sharedTagNeighbors: number;
+        maxHop: number;
+    };
+}
+
+/**
+ * Compute the k-hop neighborhood around a center node.
+ * Returns all notes within `hops` edges of the center, annotated with
+ * how they connect (backlink, outgoing, shared-tags) and their hop distance.
+ */
+export function kHopNeighborhood(
+    graph: VaultGraph,
+    centerId: string,
+    hops: number = 1,
+): NeighborhoodResult {
+    const center = graph.nodeMap.get(centerId);
+    if (!center) {
+        return {
+            center: { id: centerId, path: centerId, tags: [] },
+            neighbors: [],
+            stats: { totalNeighbors: 0, backlinks: 0, outgoing: 0, sharedTagNeighbors: 0, maxHop: 0 },
+        };
+    }
+
+    // Classify direct edges from/to center
+    const backlinks = new Map<string, VaultEdge>();
+    const outgoing = new Map<string, VaultEdge>();
+    const tagNeighbors = new Map<string, VaultEdge>();
+
+    for (const edge of graph.edges) {
+        if (edge.to === centerId && edge.from !== centerId) {
+            if (!backlinks.has(edge.from) || edge.confidence === "EXTRACTED") {
+                backlinks.set(edge.from, edge);
+            }
+        }
+        if (edge.from === centerId && edge.to !== centerId) {
+            if (!outgoing.has(edge.to) || edge.confidence === "EXTRACTED") {
+                outgoing.set(edge.to, edge);
+            }
+        }
+        if (edge.type === "shared-tags") {
+            if (edge.from === centerId && !tagNeighbors.has(edge.to)) {
+                tagNeighbors.set(edge.to, edge);
+            }
+            if (edge.to === centerId && !tagNeighbors.has(edge.from)) {
+                tagNeighbors.set(edge.from, edge);
+            }
+        }
+    }
+
+    // BFS from center up to `hops` levels
+    const visited = new Set<string>([centerId]);
+    const neighbors: NeighborhoodNote[] = [];
+    let currentFrontier = [centerId];
+
+    for (let hop = 1; hop <= hops; hop++) {
+        const nextFrontier: string[] = [];
+
+        for (const nodeId of currentFrontier) {
+            const nodeNeighbors = graph.adjacency.get(nodeId);
+            if (!nodeNeighbors) continue;
+
+            for (const neighborId of nodeNeighbors) {
+                if (visited.has(neighborId)) continue;
+                visited.add(neighborId);
+
+                const neighborNode = graph.nodeMap.get(neighborId);
+                if (!neighborNode) continue;
+
+                // Determine connection type relative to center
+                let connection: NeighborhoodNote["connection"];
+                if (hop === 1) {
+                    // Direct neighbor — classify by edge relationship to center
+                    const blEdge = backlinks.get(neighborId);
+                    const outEdge = outgoing.get(neighborId);
+                    const tagEdge = tagNeighbors.get(neighborId);
+
+                    if (blEdge) {
+                        connection = { type: "backlink", edgeType: blEdge.type, hop };
+                    } else if (outEdge) {
+                        connection = { type: "outgoing", edgeType: outEdge.type, hop };
+                    } else if (tagEdge) {
+                        connection = {
+                            type: "shared-tags",
+                            edgeType: "shared-tags",
+                            sharedTags: tagEdge.sharedTags,
+                            hop,
+                        };
+                    } else {
+                        connection = { type: "outgoing", edgeType: "wiki", hop };
+                    }
+                } else {
+                    // Indirect neighbor — mark with hop distance
+                    connection = { type: "outgoing", edgeType: "graph", hop };
+                }
+
+                neighbors.push({
+                    id: neighborNode.id,
+                    path: neighborNode.path,
+                    tags: neighborNode.tags,
+                    connection,
+                });
+                nextFrontier.push(neighborId);
+            }
+        }
+
+        currentFrontier = nextFrontier;
+        if (currentFrontier.length === 0) break;
+    }
+
+    const backlinkCount = neighbors.filter((n) => n.connection.type === "backlink").length;
+    const outgoingCount = neighbors.filter((n) => n.connection.type === "outgoing").length;
+    const tagCount = neighbors.filter((n) => n.connection.type === "shared-tags").length;
+
+    return {
+        center: { id: center.id, path: center.path, tags: center.tags },
+        neighbors,
+        stats: {
+            totalNeighbors: neighbors.length,
+            backlinks: backlinkCount,
+            outgoing: outgoingCount,
+            sharedTagNeighbors: tagCount,
+            maxHop: hops,
+        },
     };
 }

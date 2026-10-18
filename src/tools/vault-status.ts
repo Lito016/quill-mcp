@@ -132,6 +132,7 @@ async function collectFileStats(dir: string): Promise<{
             for (const entry of entries) {
                 if (
                     entry.name === ".trash" ||
+                    entry.name === ".versions" ||
                     entry.name === ".quill-sessions" ||
                     entry.name === "node_modules" ||
                     entry.name === ".git"
@@ -180,6 +181,7 @@ async function collectRecentFiles(dir: string, limit: number): Promise<FileStatE
             for (const entry of entries) {
                 if (
                     entry.name === ".trash" ||
+                    entry.name === ".versions" ||
                     entry.name === ".quill-sessions" ||
                     entry.name === "node_modules" ||
                     entry.name === ".git"

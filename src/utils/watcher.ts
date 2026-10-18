@@ -1,9 +1,11 @@
 import { readdir, stat, lstat } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { getVaultRoot } from "./vault.js";
+import { getVaultRoot, invalidateReadCache } from "./vault.js";
 import { logger } from "./logger.js";
 import { knowledgeIndex } from "./knowledge-index.js";
 import { searchIndex } from "./search-index.js";
+import { invalidateGraphCache } from "./graph-cache.js";
+import { vectorStore } from "./vector-store.js";
 
 interface FileSnapshot {
     mtime: number;
@@ -105,9 +107,11 @@ class VaultWatcher {
             for (const entry of entries) {
                 if (
                     entry.name === ".trash" ||
+                    entry.name === ".versions" ||
                     entry.name === ".quill-sessions" ||
                     entry.name === "node_modules" ||
-                    entry.name === ".git"
+                    entry.name === ".git" ||
+                    entry.name === ".embeddings"
                 )
                     continue;
 
@@ -183,6 +187,20 @@ class VaultWatcher {
         if (this.pendingChanges.length > previousChangeCount) {
             knowledgeIndex.markDirty();
             searchIndex.markDirty();
+            // Invalidate read cache and graph cache so external edits are visible
+            // on next access. Internal writes already invalidate per-path, but this
+            // catches edits from Obsidian, other agents, or manual file changes.
+            invalidateReadCache();
+            invalidateGraphCache();
+            // Invalidate embeddings for changed markdown files
+            for (const change of this.pendingChanges.slice(previousChangeCount)) {
+                if (change.path.endsWith(".md") && !change.path.startsWith(".embeddings/")) {
+                    vectorStore.invalidate(change.path).catch(() => {});
+                }
+            }
+            logger.debug("Cache invalidation triggered by external file changes", {
+                newChanges: this.pendingChanges.length - previousChangeCount,
+            });
         }
 
         // Bound event accumulation: drop oldest changes if over limit
@@ -202,9 +220,11 @@ class VaultWatcher {
             for (const entry of entries) {
                 if (
                     entry.name === ".trash" ||
+                    entry.name === ".versions" ||
                     entry.name === ".quill-sessions" ||
                     entry.name === "node_modules" ||
-                    entry.name === ".git"
+                    entry.name === ".git" ||
+                    entry.name === ".embeddings"
                 )
                     continue;
 

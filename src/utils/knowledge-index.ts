@@ -36,7 +36,7 @@ export interface DiscoveryResult {
     preview?: string;
 }
 
-const SKIPPED_DIRECTORIES = new Set([".trash", ".quill-sessions", ".git", "node_modules"]);
+const SKIPPED_DIRECTORIES = new Set([".trash", ".versions", ".quill-sessions", ".git", "node_modules"]);
 
 function normalized(value: string): string {
     return value.normalize("NFKC").trim().toLocaleLowerCase();
@@ -107,6 +107,10 @@ class KnowledgeIndex {
     private folders = new Set<string>();
     /** Inverted term index: normalised token → set of entry paths */
     private termIndex = new Map<string, Set<string>>();
+    /** lowercase path → actual indexed key (Windows case-insensitivity) */
+    private caseIndex = new Map<string, string>();
+    /** Paths queued for precise re-check on the next sync (see index-invalidation.ts) */
+    private pendingInvalidations = new Set<string>();
     private root = "";
     private initialized = false;
     private dirty = true;
@@ -119,6 +123,8 @@ class KnowledgeIndex {
         this.entries.clear();
         this.folders.clear();
         this.termIndex.clear();
+        this.caseIndex.clear();
+        this.pendingInvalidations.clear();
         this.root = "";
         this.initialized = false;
         this.dirty = true;
@@ -129,7 +135,44 @@ class KnowledgeIndex {
     }
 
     async ensureSynchronized(): Promise<void> {
-        if (!this.isInitialized() || this.dirty) await this.synchronize();
+        if (!this.isInitialized() || this.dirty) {
+            this.pendingInvalidations.clear();
+            await this.synchronize();
+            return;
+        }
+        if (this.pendingInvalidations.size === 0) return;
+        const pending = [...this.pendingInvalidations];
+        this.pendingInvalidations.clear();
+        for (const path of pending) await this.reconcilePath(path);
+    }
+
+    /**
+     * Queue a precise re-check of one vault-relative path on the next sync.
+     * Unlike markDirty, this never triggers a full vault walk on its own.
+     */
+    invalidatePath(path: string): void {
+        this.pendingInvalidations.add(path.replace(/\\/g, "/"));
+    }
+
+    /**
+     * Find the closest indexed term to `word` using Levenshtein distance.
+     * Returns undefined if no close match exists.
+     */
+    suggestCorrection(word: string): string | undefined {
+        const target = normalized(word);
+        const tol = Math.max(1, autoTolerance(target.length));
+        let best: string | undefined;
+        let bestDist = tol + 1;
+
+        for (const term of this.termIndex.keys()) {
+            if (Math.abs(term.length - target.length) > tol) continue;
+            const dist = levenshteinDistance(target, term);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = term;
+            }
+        }
+        return best && bestDist <= tol ? best : undefined;
     }
 
     async refresh(): Promise<{ indexed: number; folders: number }> {
@@ -143,68 +186,140 @@ class KnowledgeIndex {
         const root = getVaultRoot();
         if (this.root !== root) this.reset();
         this.root = root;
+        this.pendingInvalidations.clear();
 
         const seen = new Set<string>();
         const folders = new Set<string>();
         await this.scan(root, seen, folders);
-        for (const path of this.entries.keys()) {
-            if (!seen.has(path)) this.entries.delete(path);
+        for (const path of [...this.entries.keys()]) {
+            if (!seen.has(path)) this.removeEntry(path);
         }
         this.folders = folders;
-        this.rebuildTermIndex();
         this.initialized = true;
         this.dirty = false;
     }
 
-    /** Build the inverted term index from all current entries. */
-    private rebuildTermIndex(): void {
-        this.termIndex.clear();
-        for (const entry of this.entries.values()) {
-            // Index filename tokens
-            const stem = normalized(entry.filename.slice(0, -entry.extension.length || undefined));
-            for (const token of tokenize(stem)) {
-                let set = this.termIndex.get(token);
-                if (!set) { set = new Set(); this.termIndex.set(token, set); }
-                set.add(entry.path);
-            }
-            // Index title tokens
-            if (entry.title) {
-                for (const token of tokenize(entry.title)) {
-                    let set = this.termIndex.get(token);
-                    if (!set) { set = new Set(); this.termIndex.set(token, set); }
-                    set.add(entry.path);
-                }
-            }
-            // Index tag tokens
-            for (const tag of entry.tags) {
-                for (const token of tokenize(tag)) {
-                    let set = this.termIndex.get(token);
-                    if (!set) { set = new Set(); this.termIndex.set(token, set); }
-                    set.add(entry.path);
-                }
-            }
-            // Index alias tokens
-            for (const alias of entry.aliases) {
-                for (const token of tokenize(alias)) {
-                    let set = this.termIndex.get(token);
-                    if (!set) { set = new Set(); this.termIndex.set(token, set); }
-                    set.add(entry.path);
-                }
-            }
-            // Index heading tokens
-            for (const heading of entry.headings) {
-                for (const token of tokenize(heading)) {
-                    let set = this.termIndex.get(token);
-                    if (!set) { set = new Set(); this.termIndex.set(token, set); }
-                    set.add(entry.path);
-                }
-            }
-            // Index content tokens
-            for (const token of entry.contentTokens.keys()) {
-                let set = this.termIndex.get(token);
-                if (!set) { set = new Set(); this.termIndex.set(token, set); }
-                set.add(entry.path);
-            }
+    // ── Incremental term-index maintenance ───────────────────────────
+
+    private addTerm(token: string, path: string): void {
+        let set = this.termIndex.get(token);
+        if (!set) {
+            set = new Set();
+            this.termIndex.set(token, set);
+        }
+        set.add(path);
+    }
+
+    private removeTerm(token: string, path: string): void {
+        const set = this.termIndex.get(token);
+        if (!set) return;
+        set.delete(path);
+        if (set.size === 0) this.termIndex.delete(token);
+    }
+
+    /** Index one entry's filename/title/tags/aliases/headings/content tokens. */
+    private addToTermIndex(entry: KnowledgeEntry): void {
+        const stem = normalized(entry.filename.slice(0, -entry.extension.length || undefined));
+        for (const token of tokenize(stem)) this.addTerm(token, entry.path);
+        if (entry.title) for (const token of tokenize(entry.title)) this.addTerm(token, entry.path);
+        for (const tag of entry.tags) for (const token of tokenize(tag)) this.addTerm(token, entry.path);
+        for (const alias of entry.aliases) for (const token of tokenize(alias)) this.addTerm(token, entry.path);
+        for (const heading of entry.headings) for (const token of tokenize(heading)) this.addTerm(token, entry.path);
+        for (const token of entry.contentTokens.keys()) this.addTerm(token, entry.path);
+    }
+
+    /** Remove one entry's tokens from the term index. */
+    private removeFromTermIndex(entry: KnowledgeEntry): void {
+        const stem = normalized(entry.filename.slice(0, -entry.extension.length || undefined));
+        for (const token of tokenize(stem)) this.removeTerm(token, entry.path);
+        if (entry.title) for (const token of tokenize(entry.title)) this.removeTerm(token, entry.path);
+        for (const tag of entry.tags) for (const token of tokenize(tag)) this.removeTerm(token, entry.path);
+        for (const alias of entry.aliases) for (const token of tokenize(alias)) this.removeTerm(token, entry.path);
+        for (const heading of entry.headings) for (const token of tokenize(heading)) this.removeTerm(token, entry.path);
+        for (const token of entry.contentTokens.keys()) this.removeTerm(token, entry.path);
+    }
+
+    /** Insert or replace an entry, keeping the term index incremental. */
+    private upsertEntry(entry: KnowledgeEntry): void {
+        const existing = this.entries.get(entry.path);
+        if (existing) this.removeFromTermIndex(existing);
+        this.entries.set(entry.path, entry);
+        this.caseIndex.set(entry.path.toLowerCase(), entry.path);
+        this.addToTermIndex(entry);
+    }
+
+    /** Remove an entry and its term-index postings. */
+    private removeEntry(path: string): void {
+        const existing = this.entries.get(path);
+        if (existing) this.removeFromTermIndex(existing);
+        this.entries.delete(path);
+        this.caseIndex.delete(path.toLowerCase());
+    }
+
+    /**
+     * Re-check exactly one path after a server-side mutation: re-index it when
+     * it changed, remove it when it vanished, or reconcile its subtree when it
+     * is a folder (create/rename/delete of directories).
+     */
+    private async reconcilePath(pendingPath: string): Promise<void> {
+        if (pendingPath.split("/").some((segment) => segment === "" || segment === "..")) return;
+        const root = getVaultRoot();
+        const fullPath = join(root, pendingPath);
+        const key = this.entries.has(pendingPath) ? pendingPath : this.caseIndex.get(pendingPath.toLowerCase());
+        let info;
+        try {
+            info = await lstat(fullPath);
+        } catch {
+            if (key) this.removeEntry(key);
+            this.pruneFolderPrefix(pendingPath);
+            return;
+        }
+        if (info.isSymbolicLink()) {
+            if (key) this.removeEntry(key);
+            return;
+        }
+        if (info.isDirectory()) {
+            await this.reconcileDirectory(root, pendingPath);
+            return;
+        }
+        if (!info.isFile()) return;
+        try {
+            const s = await stat(fullPath);
+            const fingerprint = `${s.mtimeMs}:${s.size}`;
+            if (key && this.entries.get(key)?.fingerprint === fingerprint) return;
+            await this.indexFile(fullPath, key ?? pendingPath, fingerprint, s.size, s.mtime.toISOString());
+        } catch {
+            if (key) this.removeEntry(key);
+        }
+    }
+
+    /** Re-index a folder subtree and prune entries/folders that vanished with it. */
+    private async reconcileDirectory(root: string, dirRel: string): Promise<void> {
+        const seen = new Set<string>();
+        const folders = new Set<string>();
+        folders.add(dirRel);
+        try {
+            await this.scan(join(root, dirRel), seen, folders);
+        } catch {
+            // Scan raced with a mutation — degrade to a full resync next time
+            this.dirty = true;
+            return;
+        }
+        const prefix = `${dirRel.toLowerCase()}/`;
+        for (const path of [...this.entries.keys()]) {
+            if (path.toLowerCase().startsWith(prefix) && !seen.has(path)) this.removeEntry(path);
+        }
+        for (const path of [...this.folders]) {
+            if (path.toLowerCase().startsWith(prefix) && !folders.has(path)) this.folders.delete(path);
+        }
+        for (const path of folders) this.folders.add(path);
+    }
+
+    /** Drop tracked folder entries under a removed prefix. */
+    private pruneFolderPrefix(dirRel: string): void {
+        const prefix = `${dirRel.toLowerCase()}/`;
+        for (const path of [...this.folders]) {
+            if (path.toLowerCase().startsWith(prefix)) this.folders.delete(path);
         }
     }
 
@@ -370,6 +485,9 @@ class KnowledgeIndex {
         );
     }
 
+    /** Per-directory I/O width for scans (bounded, not sequential, not unbounded). */
+    private static readonly SCAN_WIDTH = 16;
+
     private async scan(dir: string, seen: Set<string>, folders: Set<string>): Promise<void> {
         let items;
         try {
@@ -377,46 +495,64 @@ class KnowledgeIndex {
         } catch {
             return;
         }
-        items.sort((a, b) => a.name.localeCompare(b.name, "en"));
+        const subdirs: string[] = [];
+        const files: { fullPath: string; path: string; name: string }[] = [];
         for (const item of items) {
             if (SKIPPED_DIRECTORIES.has(item.name)) continue;
             const fullPath = join(dir, item.name);
-            // Symlink defense: use lstat to detect symlinks and junctions
-            const itemStat = await lstat(fullPath);
-            if (itemStat.isSymbolicLink()) continue;
-            const path = relativePath(this.root, fullPath);
             if (item.isDirectory()) {
-                folders.add(path);
-                await this.scan(fullPath, seen, folders);
+                subdirs.push(fullPath);
             } else if (item.isFile()) {
-                seen.add(path);
-                let info;
-                try {
-                    info = await stat(fullPath);
-                } catch {
-                    continue;
-                }
-                const fingerprint = `${info.mtimeMs}:${info.size}`;
-                if (this.entries.get(path)?.fingerprint === fingerprint) continue;
-                if (extname(item.name).toLowerCase() === ".md") {
-                    await this.indexFile(fullPath, path, fingerprint, info.size, info.mtime.toISOString());
-                } else {
-                    this.entries.set(path, {
-                        path,
-                        filename: basename(path),
-                        extension: extname(path).toLowerCase(),
-                        folder: dirname(path).replace(/\\/g, "/") === "." ? "" : dirname(path).replace(/\\/g, "/"),
-                        tags: [],
-                        aliases: [],
-                        headings: [],
-                        size: info.size,
-                        modified: info.mtime.toISOString(),
-                        contentTokens: new Map(),
-                        fingerprint,
-                    });
-                }
+                files.push({ fullPath, path: relativePath(this.root, fullPath), name: item.name });
             }
         }
+        // Stat/read files with bounded concurrency
+        for (let i = 0; i < files.length; i += KnowledgeIndex.SCAN_WIDTH) {
+            await Promise.all(
+                files.slice(i, i + KnowledgeIndex.SCAN_WIDTH).map(async ({ fullPath, path, name }) => {
+                    try {
+                        // Symlink defense: never index symlinks or junctions
+                        if ((await lstat(fullPath)).isSymbolicLink()) return;
+                        seen.add(path);
+                        const info = await stat(fullPath);
+                        const fingerprint = `${info.mtimeMs}:${info.size}`;
+                        if (this.entries.get(path)?.fingerprint === fingerprint) return;
+                        if (extname(name).toLowerCase() === ".md") {
+                            await this.indexFile(fullPath, path, fingerprint, info.size, info.mtime.toISOString());
+                        } else {
+                            this.upsertEntry({
+                                path,
+                                filename: basename(path),
+                                extension: extname(path).toLowerCase(),
+                                folder: dirname(path).replace(/\\/g, "/") === "." ? "" : dirname(path).replace(/\\/g, "/"),
+                                tags: [],
+                                aliases: [],
+                                headings: [],
+                                size: info.size,
+                                modified: info.mtime.toISOString(),
+                                contentTokens: new Map(),
+                                fingerprint,
+                            });
+                        }
+                    } catch {
+                        // Skip unreadable
+                    }
+                }),
+            );
+        }
+        // Recurse into subdirectories (each serialises its own subtree scan)
+        await Promise.all(
+            subdirs.map(async (subdir) => {
+                try {
+                    // Symlink defense: never recurse into symlinks or junctions
+                    if ((await lstat(subdir)).isSymbolicLink()) return;
+                    folders.add(relativePath(this.root, subdir));
+                    await this.scan(subdir, seen, folders);
+                } catch {
+                    // Skip inaccessible directories
+                }
+            }),
+        );
     }
 
     private async indexFile(
@@ -432,7 +568,7 @@ class KnowledgeIndex {
             const headings = [...parsed.content.matchAll(/^#{1,6}\s+(.+?)\s*#*\s*$/gm)].map((match) => match[1].trim());
             const titleValue = parsed.frontmatter.title;
             const title = typeof titleValue === "string" && titleValue.trim() ? titleValue.trim() : undefined;
-            this.entries.set(path, {
+            this.upsertEntry({
                 path,
                 filename: basename(path),
                 extension: extname(path).toLowerCase(),
@@ -448,7 +584,7 @@ class KnowledgeIndex {
                 fingerprint,
             });
         } catch {
-            this.entries.delete(path);
+            this.removeEntry(path);
         }
     }
 }

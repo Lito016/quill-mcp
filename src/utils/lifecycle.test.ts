@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { validateTransition, getAvailableTransitions, isActiveStatus } from "./lifecycle.js";
+import { validateTransition, getAvailableTransitions, isActiveStatus, isTerminalStatus, describeStatus } from "./lifecycle.js";
+import type { MemoryStatus } from "./memory-schema.js";
 
 describe("Memory Lifecycle", () => {
     describe("validateTransition", () => {
@@ -117,6 +118,68 @@ describe("Memory Lifecycle", () => {
 
         it("should return false for REJECTED", () => {
             expect(isActiveStatus("REJECTED")).toBe(false);
+        });
+    });
+
+    describe("isTerminalStatus", () => {
+        it("returns true for SUPERSEDED (only terminal state)", () => {
+            expect(isTerminalStatus("SUPERSEDED")).toBe(true);
+        });
+
+        it("returns false for all non-terminal states", () => {
+            expect(isTerminalStatus("ACTIVE")).toBe(false);
+            expect(isTerminalStatus("CONFIRMED")).toBe(false);
+            expect(isTerminalStatus("DEPRECATED")).toBe(false);
+            expect(isTerminalStatus("CONFLICTED")).toBe(false);
+            expect(isTerminalStatus("REJECTED")).toBe(false);
+            expect(isTerminalStatus("EXPIRED")).toBe(false);
+            expect(isTerminalStatus("ARCHIVED")).toBe(false);
+        });
+    });
+
+    describe("describeStatus", () => {
+        it("returns a human-readable description for each status", () => {
+            expect(describeStatus("ACTIVE").toLowerCase()).toContain("active");
+            expect(describeStatus("CONFIRMED").toLowerCase()).toContain("confirmed");
+            expect(describeStatus("DEPRECATED").toLowerCase()).toContain("no longer");
+            expect(describeStatus("SUPERSEDED").toLowerCase()).toContain("replaced");
+            expect(describeStatus("CONFLICTED").toLowerCase()).toContain("contradicts");
+            expect(describeStatus("REJECTED").toLowerCase()).toContain("rejected");
+            expect(describeStatus("EXPIRED").toLowerCase()).toContain("expired");
+            expect(describeStatus("ARCHIVED").toLowerCase()).toContain("archive");
+        });
+    });
+
+    describe("validateTransition error messages", () => {
+        it("includes valid targets in rejection error", () => {
+            const result = validateTransition("DEPRECATED", "ACTIVE");
+            expect(result.success).toBe(false);
+            expect(result.error).toContain("ARCHIVED");
+        });
+
+        it("reports unknown source status", () => {
+            const result = validateTransition("UNKNOWN" as MemoryStatus, "ACTIVE");
+            expect(result.success).toBe(false);
+            expect(result.error).toContain("Unknown source status");
+        });
+
+        it("resurrection error mentions evidence requirement", () => {
+            const result = validateTransition("ARCHIVED", "ACTIVE");
+            expect(result.error).toContain("evidence");
+        });
+    });
+
+    describe("EXPIRED and REJECTED transitions", () => {
+        it("allows EXPIRED → ARCHIVED", () => {
+            expect(validateTransition("EXPIRED", "ARCHIVED").success).toBe(true);
+        });
+
+        it("rejects EXPIRED → ACTIVE", () => {
+            expect(validateTransition("EXPIRED", "ACTIVE").success).toBe(false);
+        });
+
+        it("allows REJECTED → ARCHIVED", () => {
+            expect(validateTransition("REJECTED", "ARCHIVED").success).toBe(true);
         });
     });
 });

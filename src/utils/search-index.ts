@@ -14,7 +14,7 @@ import { levenshteinDistance, autoTolerance } from "./fuzzy-search.js";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
-const SKIP_DIRS = new Set([".trash", ".quill-sessions", ".git", "node_modules"]);
+const SKIP_DIRS = new Set([".trash", ".versions", ".quill-sessions", ".git", "node_modules"]);
 const TOKEN_RE = /[\p{L}\p{N}]+/gu;
 
 export interface IndexedDocument {
@@ -57,6 +57,10 @@ class SearchIndex {
     private inverted = new Map<string, Set<string>>();
     /** Fingerprint cache for incremental sync (path → mtime:size) */
     private fingerprints = new Map<string, string>();
+    /** lowercase path → actual indexed key (Windows case-insensitivity) */
+    private caseIndex = new Map<string, string>();
+    /** Paths queued for precise re-check on the next sync (see index-invalidation.ts) */
+    private pendingInvalidations = new Set<string>();
     private dirty = true;
     private totalDocs = 0;
     private avgDocLength = 0;
@@ -70,8 +74,24 @@ class SearchIndex {
     }
 
     async ensureSynchronized(): Promise<void> {
-        if (!this.dirty && this.documents.size > 0) return;
-        await this.build();
+        if (this.dirty || this.documents.size === 0) {
+            this.pendingInvalidations.clear();
+            await this.build();
+            return;
+        }
+        if (this.pendingInvalidations.size === 0) return;
+        const pending = [...this.pendingInvalidations];
+        this.pendingInvalidations.clear();
+        for (const path of pending) await this.reconcilePath(path);
+        this.recomputeStats();
+    }
+
+    /**
+     * Queue a precise re-check of one vault-relative path on the next sync.
+     * Unlike markDirty, this never triggers a full vault walk on its own.
+     */
+    invalidatePath(path: string): void {
+        this.pendingInvalidations.add(path.replace(/\\/g, "/"));
     }
 
     getDocuments(): IndexedDocument[] {
@@ -149,6 +169,7 @@ class SearchIndex {
     private async synchronize(): Promise<void> {
         const root = getVaultRoot();
         const seen = new Set<string>();
+        this.pendingInvalidations.clear();
 
         await this.scanDir(root, root, seen);
 
@@ -160,26 +181,86 @@ class SearchIndex {
             if (!seen.has(path)) this.fingerprints.delete(path);
         }
 
-        // Recompute BM25 globals from current state
+        this.recomputeStats();
+        this.dirty = false;
+    }
+
+    /** Recompute BM25 globals (doc count, average length) and the term list. */
+    private recomputeStats(): void {
         this.totalDocs = this.documents.size;
         let totalTokens = 0;
         for (const doc of this.documents.values()) totalTokens += doc.tokenCount;
         this.avgDocLength = this.totalDocs > 0 ? totalTokens / this.totalDocs : 1;
-
         // Collect unique terms for suggestions
         this.allTerms = [...this.inverted.keys()].sort();
-
-        this.dirty = false;
     }
 
     /** Remove a document from the index and clean up its inverted entries. */
     private removeDoc(path: string): void {
-        this.documents.delete(path);
-        for (const [, set] of this.inverted) {
-            set.delete(path);
-            if (set.size === 0) this.inverted.delete(path);
+        const doc = this.documents.get(path);
+        if (doc) {
+            // Walk only this document's own tokens instead of every posting list
+            for (const token of doc.termFreq.keys()) {
+                const set = this.inverted.get(token);
+                if (set) {
+                    set.delete(path);
+                    if (set.size === 0) this.inverted.delete(token);
+                }
+            }
+            this.documents.delete(path);
+        }
+        this.fingerprints.delete(path);
+        this.caseIndex.delete(path.toLowerCase());
+    }
+
+    /**
+     * Re-check exactly one path after a server-side mutation: re-index it when
+     * it changed, remove it when it vanished, or reconcile its subtree when it
+     * is a folder (create/rename/delete of directories).
+     */
+    private async reconcilePath(pendingPath: string): Promise<void> {
+        if (pendingPath.split("/").some((segment) => segment === "" || segment === "..")) return;
+        const root = getVaultRoot();
+        const fullPath = `${root}/${pendingPath}`;
+        const key = this.documents.has(pendingPath) ? pendingPath : this.caseIndex.get(pendingPath.toLowerCase());
+        let info;
+        try {
+            info = await lstat(fullPath);
+        } catch {
+            if (key) this.removeDoc(key);
+            return;
+        }
+        if (info.isSymbolicLink()) {
+            if (key) this.removeDoc(key);
+            return;
+        }
+        if (info.isDirectory()) {
+            await this.reconcileDirectory(root, pendingPath);
+            return;
+        }
+        if (!info.isFile()) return;
+        try {
+            const s = await stat(fullPath);
+            const fingerprint = `${s.mtimeMs}:${s.size}`;
+            if (key && this.fingerprints.get(key) === fingerprint) return;
+            await this.indexFile(root, fullPath, fingerprint, key ?? pendingPath);
+        } catch {
+            if (key) this.removeDoc(key);
         }
     }
+
+    /** Re-index a folder subtree and prune indexed docs that vanished with it. */
+    private async reconcileDirectory(root: string, dirRel: string): Promise<void> {
+        const seen = new Set<string>();
+        await this.scanDir(root, `${root}/${dirRel}`, seen);
+        const prefix = `${dirRel.toLowerCase()}/`;
+        for (const path of [...this.documents.keys()]) {
+            if (path.toLowerCase().startsWith(prefix) && !seen.has(path)) this.removeDoc(path);
+        }
+    }
+
+    /** Per-directory I/O width for scans (bounded, not sequential, not unbounded). */
+    private static readonly SCAN_WIDTH = 16;
 
     private async scanDir(root: string, dir: string, seen: Set<string>): Promise<void> {
         let entries;
@@ -188,36 +269,51 @@ class SearchIndex {
         } catch {
             return;
         }
+        const subdirs: string[] = [];
+        const files: { fullPath: string; relPath: string }[] = [];
         for (const entry of entries) {
             if (SKIP_DIRS.has(entry.name)) continue;
             const fullPath = `${dir}/${entry.name}`;
-            // Symlink defense: never recurse into symbolic links
-            try {
-                const entryStat = await lstat(fullPath);
-                if (entryStat.isSymbolicLink()) continue;
-            } catch {
-                continue;
-            }
             if (entry.isDirectory()) {
-                await this.scanDir(root, fullPath, seen);
+                subdirs.push(fullPath);
             } else if (entry.isFile() && entry.name.endsWith(".md")) {
-                const relPath = relative(root, fullPath).replace(/\\/g, "/");
-                seen.add(relPath);
-                try {
-                    const s = await stat(fullPath);
-                    const fingerprint = `${s.mtimeMs}:${s.size}`;
-                    if (this.fingerprints.get(relPath) === fingerprint) continue;
-                    await this.indexFile(root, fullPath, fingerprint);
-                } catch {
-                    // Skip unreadable
-                }
+                files.push({ fullPath, relPath: relative(root, fullPath).replace(/\\/g, "/") });
             }
         }
+        // Stat/read markdown files with bounded concurrency
+        for (let i = 0; i < files.length; i += SearchIndex.SCAN_WIDTH) {
+            await Promise.all(
+                files.slice(i, i + SearchIndex.SCAN_WIDTH).map(async ({ fullPath, relPath }) => {
+                    try {
+                        // Symlink defense: never index symbolic links
+                        if ((await lstat(fullPath)).isSymbolicLink()) return;
+                        seen.add(relPath);
+                        const s = await stat(fullPath);
+                        const fingerprint = `${s.mtimeMs}:${s.size}`;
+                        if (this.fingerprints.get(relPath) === fingerprint) return;
+                        await this.indexFile(root, fullPath, fingerprint, relPath);
+                    } catch {
+                        // Skip unreadable
+                    }
+                }),
+            );
+        }
+        // Recurse into subdirectories (each serialises its own subtree scan)
+        await Promise.all(
+            subdirs.map(async (subdir) => {
+                try {
+                    // Symlink defense: never recurse into symbolic links
+                    if ((await lstat(subdir)).isSymbolicLink()) return;
+                    await this.scanDir(root, subdir, seen);
+                } catch {
+                    // Skip inaccessible directories
+                }
+            }),
+        );
     }
 
-    private async indexFile(root: string, fullPath: string, fingerprint: string): Promise<void> {
+    private async indexFile(root: string, fullPath: string, fingerprint: string, relPath: string): Promise<void> {
         const raw = await readFile(fullPath, "utf-8");
-        const relPath = relative(root, fullPath).replace(/\\/g, "/");
         const { frontmatter } = parseFrontmatter(raw);
 
         const lines = raw.split("\n").map((l) => l.trim());
@@ -273,6 +369,7 @@ class SearchIndex {
 
         this.documents.set(relPath, doc);
         this.fingerprints.set(relPath, fingerprint);
+        this.caseIndex.set(relPath.toLowerCase(), relPath);
 
         // Update inverted index with new tokens
         for (const token of termFreq.keys()) {

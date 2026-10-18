@@ -137,7 +137,7 @@ async function findOrphanNotes(dirPath: string): Promise<{ content: { type: "tex
     async function scanDir(dir: string) {
         const entries = await readdir(dir, { withFileTypes: true });
         for (const entry of entries) {
-            if (entry.name === ".trash" || entry.name === ".quill-sessions") continue;
+            if (entry.name === ".trash" || entry.name === ".quill-sessions" || entry.name === ".versions") continue;
             const fullPath = `${dir}/${entry.name}`;
             // Symlink defense: never recurse into symbolic links
             const entryStat = await lstat(fullPath);

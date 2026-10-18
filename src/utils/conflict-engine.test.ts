@@ -3,7 +3,7 @@
  * Tests resolution logic and supersession chain tracing.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { resolveConflict, getSupersessionChain } from "./conflict-engine.js";
+import { resolveConflict, getSupersessionChain, detectConflicts, checkConflicts } from "./conflict-engine.js";
 import { metadataIndex } from "./metadata-index.js";
 import { initVault } from "./vault.js";
 import type { MemoryMetadata } from "./memory-schema.js";
@@ -71,6 +71,8 @@ describe("Conflict Engine", () => {
     beforeEach(() => {
         // Clear the metadata index without triggering a vault scan
         metadataIndex.invalidate();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (metadataIndex as any).initialized = true;
     });
 
     describe("pair comparison logic", () => {
@@ -210,6 +212,174 @@ describe("Conflict Engine", () => {
         it("returns start-only chain for nonexistent memory", async () => {
             const chain = await getSupersessionChain("mem_nonexistent");
             expect(chain).toEqual(["mem_nonexistent"]);
+        });
+    });
+
+    describe("detectConflicts", () => {
+        it("detects conflicts between same-entity memories with different content", async () => {
+            const mem1 = makeMemory({
+                id: "det_1",
+                entity: "database",
+                type: "DECISION",
+                contentPreview: "Use PostgreSQL for the database",
+            });
+            const mem2 = makeMemory({
+                id: "det_2",
+                entity: "database",
+                type: "DECISION",
+                contentPreview: "Use MySQL for the database",
+            });
+            injectMemory(mem1);
+            injectMemory(mem2);
+
+            const result = await detectConflicts("test-project");
+            expect(result.conflicts).toHaveLength(1);
+            expect(result.conflicts[0].conflictingEntity).toBe("database");
+            expect(result.scannedCount).toBe(2);
+        });
+
+        it("does not flag same-content memories as conflicts", async () => {
+            const mem1 = makeMemory({
+                id: "same_1",
+                entity: "api",
+                type: "FACT",
+                contentPreview: "REST API with JSON",
+            });
+            const mem2 = makeMemory({
+                id: "same_2",
+                entity: "api",
+                type: "FACT",
+                contentPreview: "REST API with JSON",
+            });
+            injectMemory(mem1);
+            injectMemory(mem2);
+
+            const result = await detectConflicts("test-project");
+            expect(result.conflicts).toHaveLength(0);
+        });
+
+        it("does not compare memories with different types", async () => {
+            const mem1 = makeMemory({
+                id: "diff_1",
+                entity: "cache",
+                type: "DECISION",
+                contentPreview: "Use Redis",
+            });
+            const mem2 = makeMemory({
+                id: "diff_2",
+                entity: "cache",
+                type: "FACT",
+                contentPreview: "Redis is used",
+            });
+            injectMemory(mem1);
+            injectMemory(mem2);
+
+            const result = await detectConflicts("test-project");
+            expect(result.conflicts).toHaveLength(0);
+        });
+
+        it("filters by type when specified", async () => {
+            const mem1 = makeMemory({ id: "filt_1", entity: "db", type: "DECISION", contentPreview: "Use PG" });
+            const mem2 = makeMemory({ id: "filt_2", entity: "db", type: "DECISION", contentPreview: "Use MySQL" });
+            injectMemory(mem1);
+            injectMemory(mem2);
+
+            const result = await detectConflicts("test-project", "DECISION");
+            expect(result.conflicts).toHaveLength(1);
+
+            const noResult = await detectConflicts("test-project", "FACT");
+            expect(noResult.conflicts).toHaveLength(0);
+        });
+
+        it("assesses severity as 'likely' for DECISION type conflicts", async () => {
+            const mem1 = makeMemory({ id: "sev_1", entity: "arch", type: "DECISION", contentPreview: "Microservices" });
+            const mem2 = makeMemory({ id: "sev_2", entity: "arch", type: "DECISION", contentPreview: "Monolith" });
+            injectMemory(mem1);
+            injectMemory(mem2);
+
+            const result = await detectConflicts("test-project");
+            expect(result.conflicts[0].severity).toBe("likely");
+        });
+
+        it("returns empty conflicts when no memories exist", async () => {
+            const result = await detectConflicts("test-project");
+            expect(result.conflicts).toHaveLength(0);
+            expect(result.scannedCount).toBe(0);
+        });
+    });
+
+    describe("checkConflicts", () => {
+        it("returns conflicts for a new memory against existing ones", async () => {
+            const existing = makeMemory({
+                id: "exist_1",
+                entity: "database",
+                type: "DECISION",
+                contentPreview: "Use PostgreSQL",
+            });
+            injectMemory(existing);
+
+            const newMem = {
+                id: "new_1",
+                type: "DECISION" as const,
+                status: "ACTIVE" as const,
+                confidence: 0.8,
+                project: "test-project",
+                created: "2026-01-01T00:00:00Z",
+                updated: "2026-01-01T00:00:00Z",
+                source_type: "AGENT" as const,
+                importance: "NORMAL" as const,
+                entity: "database",
+                related: [],
+                tags: [],
+            };
+
+            const conflicts = await checkConflicts(newMem);
+            expect(conflicts).toHaveLength(1);
+            expect(conflicts[0].conflictingEntity).toBe("database");
+        });
+
+        it("returns empty array when new memory has no entity", async () => {
+            const conflicts = await checkConflicts({
+                id: "no_entity",
+                type: "FACT",
+                status: "ACTIVE",
+                confidence: 0.8,
+                project: "test-project",
+                created: "2026-01-01T00:00:00Z",
+                updated: "2026-01-01T00:00:00Z",
+                source_type: "AGENT",
+                importance: "NORMAL",
+                related: [],
+                tags: [],
+            });
+            expect(conflicts).toHaveLength(0);
+        });
+
+        it("does not compare with memories from different projects", async () => {
+            const existing = makeMemory({
+                id: "other_proj",
+                entity: "database",
+                type: "DECISION",
+                project: "other-project",
+                contentPreview: "Use PostgreSQL",
+            });
+            injectMemory(existing);
+
+            const conflicts = await checkConflicts({
+                id: "new_proj",
+                type: "DECISION",
+                status: "ACTIVE",
+                confidence: 0.8,
+                project: "test-project",
+                created: "2026-01-01T00:00:00Z",
+                updated: "2026-01-01T00:00:00Z",
+                source_type: "AGENT",
+                importance: "NORMAL",
+                entity: "database",
+                related: [],
+                tags: [],
+            });
+            expect(conflicts).toHaveLength(0);
         });
     });
 });

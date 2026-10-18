@@ -464,7 +464,7 @@ describe("Vault Utilities", () => {
                 await rm(outsideDir, { recursive: true, force: true });
                 return;
             }
-            await expect(safeWriteTarget("evil_parent/new-file.md")).rejects.toThrow();
+            await expect(safeWriteTarget("evil-parent/new-file.md")).rejects.toThrow();
             await rm(linkDir, { force: true });
             await rm(outsideDir, { recursive: true, force: true });
         });

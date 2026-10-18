@@ -1,7 +1,6 @@
-import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
-import { safeReadTarget } from "../utils/vault.js";
-import { parseFrontmatter } from "../utils/frontmatter.js";
+import { safeReadTarget, cachedReadFile } from "../utils/vault.js";
+import { parseFrontmatterPartial } from "../utils/frontmatter.js";
 import { estimateTokens } from "../utils/tokens.js";
 import * as z from "zod";
 
@@ -54,11 +53,9 @@ export async function handler({
         return { content: [{ type: "text" as const, text: `Error: Note not found at "${path}".` }], isError: true };
     }
 
-    const content = await readFile(fullPath, "utf-8");
-
-    // Frontmatter-only mode
+    // Frontmatter-only mode: use partial read (only first ~4KB) for speed
     if (frontmatter_only) {
-        const { frontmatter } = parseFrontmatter(content);
+        const { frontmatter } = await parseFrontmatterPartial(fullPath);
         if (Object.keys(frontmatter).length === 0) {
             return { content: [{ type: "text" as const, text: `No frontmatter found in "${path}".` }] };
         }
@@ -68,6 +65,8 @@ export async function handler({
         }
         return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     }
+
+    const content = await cachedReadFile(fullPath);
 
     let output = content;
     const allLines = content.split("\n");

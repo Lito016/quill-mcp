@@ -70,7 +70,8 @@ export async function handler({
     async function listDir(dir: string, prefix: string, depth: number) {
         const items = await readdir(dir, { withFileTypes: true });
         for (const item of items) {
-            if (item.name === ".trash" || item.name === ".quill-sessions") continue;
+            if (item.name === ".trash" || item.name === ".quill-sessions" || item.name === ".versions") continue;
+            if (item.name === ".webhooks.json") continue;
             const relPath = prefix ? `${prefix}/${item.name}` : item.name;
             // Symlink defense: never recurse into symbolic links
             const itemStat = await lstat(`${dir}/${item.name}`);

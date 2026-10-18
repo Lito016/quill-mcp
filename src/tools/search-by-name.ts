@@ -1,10 +1,11 @@
-import { readdir, lstat } from "node:fs/promises";
-import { resolveVaultPath, pathExists } from "../utils/vault.js";
 import * as z from "zod";
+import { resolveVaultPath, pathExists } from "../utils/vault.js";
+import { knowledgeIndex, normalizeVaultRelativePath } from "../utils/knowledge-index.js";
+import { globToRegExp } from "./search-files.js";
 
 export const name = "search_by_name";
 export const description =
-    "Search for notes by filename pattern. Supports glob-like matching with * as wildcard. Plain text does substring matching (no wildcards needed).";
+    "Search for notes by filename pattern (served from the knowledge index). Supports glob-like matching with * as wildcard (anchored). Plain text does substring matching (no wildcards needed). Internal directories (.trash, .git, .quill-sessions, node_modules) are never matched.";
 export const inputSchema = z.object({
     pattern: z
         .string()
@@ -25,29 +26,23 @@ export async function handler({ pattern, path, recursive }: { pattern: string; p
         };
     }
 
-    const results: string[] = [];
-    // If pattern contains *, treat as glob (anchored). Otherwise, substring match.
+    const safeFolder = normalizeVaultRelativePath(path);
+    await knowledgeIndex.ensureSynchronized();
+
+    // If pattern contains *, treat as anchored glob. Otherwise, substring match.
     const isGlob = pattern.includes("*");
-    const regexPattern = isGlob
-        ? new RegExp("^" + pattern.replace(/\*/g, ".*") + "$", "i")
-        : new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const regex = isGlob ? globToRegExp(pattern) : undefined;
+    const needle = pattern.normalize("NFKC").toLocaleLowerCase();
+    const prefix = safeFolder === "." ? "" : `${safeFolder}/`;
 
-    async function searchDir(dir: string, prefix: string) {
-        const items = await readdir(dir, { withFileTypes: true });
-        for (const item of items) {
-            const relPath = prefix ? `${prefix}/${item.name}` : item.name;
-            // Symlink defense: never recurse into symbolic links
-            const itemStat = await lstat(`${dir}/${item.name}`);
-            if (itemStat.isSymbolicLink()) continue;
-            if (item.isFile() && regexPattern.test(item.name)) {
-                results.push(relPath);
-            } else if (item.isDirectory() && recursive) {
-                await searchDir(`${dir}/${item.name}`, relPath);
-            }
-        }
-    }
-
-    await searchDir(dirPath, path === "." ? "" : path);
+    const results = knowledgeIndex
+        .getEntries(safeFolder)
+        .filter((entry) => {
+            if (!recursive && entry.path.slice(prefix.length).includes("/")) return false;
+            if (regex) return regex.test(entry.filename);
+            return entry.filename.normalize("NFKC").toLocaleLowerCase().includes(needle);
+        })
+        .map((entry) => entry.path);
 
     if (results.length === 0) {
         return { content: [{ type: "text" as const, text: `No files matching pattern "${pattern}".` }] };

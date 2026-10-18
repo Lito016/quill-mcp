@@ -41,6 +41,7 @@ export interface QuillConfig {
         maxFileSizeMb: number;
         rotationEnabled: boolean;
     };
+    guide: Record<string, string>;
 }
 
 const DEFAULT_CONFIG: QuillConfig = {
@@ -81,6 +82,7 @@ const DEFAULT_CONFIG: QuillConfig = {
         maxFileSizeMb: 10,
         rotationEnabled: true,
     },
+    guide: {},
 };
 
 let cachedConfig: QuillConfig | undefined;

@@ -47,7 +47,7 @@ export async function handler({
         async function scanDir(dir: string) {
             const entries = await readdir(dir, { withFileTypes: true });
             for (const entry of entries) {
-                if (entry.name === ".trash" || entry.name === ".quill-sessions") continue;
+                if (entry.name === ".trash" || entry.name === ".quill-sessions" || entry.name === ".versions") continue;
                 const entryPath = join(dir, entry.name);
                 // Symlink defense: never recurse into symbolic links
                 const entryStat = await lstat(entryPath);

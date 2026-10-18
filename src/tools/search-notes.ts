@@ -1,4 +1,4 @@
-import { resolveVaultPath, pathExists, getVaultRoot } from "../utils/vault.js";
+import { resolveVaultPath, pathExists } from "../utils/vault.js";
 import { estimateTokens, formatTokenEstimate } from "../utils/tokens.js";
 import { searchIndex, type IndexedDocument } from "../utils/search-index.js";
 import { fuzzyMatch, parseSearchOperators, highlightMatches, type ParsedQuery } from "../utils/fuzzy-search.js";
@@ -241,7 +241,23 @@ export async function handler({
     const queryTokens = query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
     const results: SearchResult[] = [];
     const allDocs = searchIndex.getDocuments();
-    const vaultRoot = getVaultRoot();
+
+    // Boundary-aware path restriction: "Projects" must not match "ProjectsX/..."
+    const searchPrefix = path === "." ? "" : path.replace(/\/+$/, "");
+    const withinSearchPath = (docPath: string): boolean =>
+        !searchPrefix || docPath === searchPrefix || docPath.startsWith(`${searchPrefix}/`);
+
+    // Document-level BM25 is computed once per doc, not once per matching line
+    const bm25Cache = new Map<string, number>();
+    const bm25For = (doc: IndexedDocument): number => {
+        if (queryTokens.length === 0) return 0;
+        let score = bm25Cache.get(doc.path);
+        if (score === undefined) {
+            score = searchIndex.bm25Score(doc, queryTokens);
+            bm25Cache.set(doc.path, score);
+        }
+        return score;
+    };
 
     // Inverted-index candidate filtering: only scan documents that contain
     // at least one query term. Falls back to all docs for regex, wildcard,
@@ -263,8 +279,8 @@ export async function handler({
     }
 
     for (const doc of docsToSearch) {
-        // Path restriction
-        if (!doc.path.startsWith(path === "." ? "" : path.replace(/\/$/, ""))) continue;
+        // Boundary-aware path restriction
+        if (!withinSearchPath(doc.path)) continue;
 
         // Extension filter
         if (fileExtension && !doc.filename.endsWith(fileExtension)) continue;
@@ -272,12 +288,10 @@ export async function handler({
         // Frontmatter gate
         if (!passesFrontmatter(doc)) continue;
 
-        // Verify file still exists on disk (index may be stale after deletes/moves)
-        const fullPath = `${vaultRoot}/${doc.path}`;
-        if (!(await pathExists(fullPath))) continue;
-
-        // Skip anything in .trash
-        if (doc.path.includes(".trash/")) continue;
+        // Server-side mutations invalidate the index synchronously (utils/index-invalidation.ts)
+        // and external edits are caught by the watcher poll, so no per-doc disk check is needed.
+        // Skip anything in .trash or .versions
+        if (doc.path.includes(".trash/") || doc.path.includes(".versions/")) continue;
 
         // Per-file match count for dedup
         let fileMatchCount = 0;
@@ -291,8 +305,8 @@ export async function handler({
             if (fileMatchCount >= MAX_PER_FILE) continue;
             fileMatchCount++;
 
-            // BM25 score
-            const bm25 = queryTokens.length > 0 ? searchIndex.bm25Score(doc, queryTokens) : 0;
+            // BM25 score (cached per document)
+            const bm25 = bm25For(doc);
 
             // Snippet extraction
             let snippet: string | undefined;
@@ -365,15 +379,17 @@ async function handleFrontmatterOnly(
     const searchTerms = parsed?.terms ?? query.trim().split(/\s+/).filter(Boolean);
     const results: SearchResult[] = [];
     const allDocs = searchIndex.getDocuments();
-    const vaultRoot = getVaultRoot();
+
+    // Boundary-aware path restriction: "Projects" must not match "ProjectsX/..."
+    const searchPrefix = searchPath === "." ? "" : searchPath.replace(/\/+$/, "");
+    const withinSearchPath = (docPath: string): boolean =>
+        !searchPrefix || docPath === searchPrefix || docPath.startsWith(`${searchPrefix}/`);
 
     for (const doc of allDocs) {
-        // Verify file still exists and skip .trash
-        const fullPath = `${vaultRoot}/${doc.path}`;
-        if (!(await pathExists(fullPath))) continue;
-        if (doc.path.includes(".trash/")) continue;
+        // Index is invalidated synchronously on server-side mutation; skip .trash and .versions
+        if (doc.path.includes(".trash/") || doc.path.includes(".versions/")) continue;
 
-        if (!doc.path.startsWith(searchPath === "." ? "" : searchPath.replace(/\/$/, ""))) continue;
+        if (!withinSearchPath(doc.path)) continue;
         if (fileExtension && !doc.filename.endsWith(fileExtension)) continue;
 
         // Search in title, tags, and all frontmatter string values

@@ -1,3 +1,33 @@
 {
-  "vaultPath": "D:/quill-mcp/vault"
+  "vaultPath": "C:/Projects/Knowledge/vault",
+  "http": {
+    "enabled": false,
+    "port": 3000,
+    "host": "127.0.0.1",
+    "auth_token": "",
+    "cors_origins": []
+  },
+  "guide": {
+    "Projects": "Project-specific notes and decisions, organized by project subfolder",
+    "solutions": "Fixes, workarounds, and resolved problem documentation",
+    "canvases": "Visual canvases and hive diagrams",
+    "sogo-video-auditor": "Sogo Video Auditor project notes",
+    "astro-starter-kit": "Astro framework starter template",
+    "django-starter-kit": "Django framework starter template",
+    "electron-starter-kit": "Electron desktop app starter template",
+    "expo-starter-kit": "Expo React Native starter template",
+    "express-starter-kit": "Express.js server starter template",
+    "fastapi-starter-kit": "FastAPI Python starter template",
+    "fasthtml-starter-kit": "FastHTML Python starter template",
+    "fastify-starter-kit": "Fastify Node.js starter template",
+    "flask-starter-kit": "Flask Python starter template",
+    "flutter-starter-kit": "Flutter mobile app starter template",
+    "laravel-starter-kit": "Laravel PHP starter template",
+    "nestjs-starter-kit": "NestJS Node.js starter template",
+    "nextjs-starter-kit": "Next.js React starter template",
+    "nuxt-starter-kit": "Nuxt Vue.js starter template",
+    "react-router-starter-kit": "React Router starter template",
+    "sveltekit-starter-kit": "SvelteKit starter template",
+    "t3-starter-kit": "T3 Stack (Next.js + tRPC + Prisma) starter template"
+  }
 }

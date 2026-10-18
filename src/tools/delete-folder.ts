@@ -3,6 +3,7 @@ import { pathExists, getPathStats, safeDeleteTarget } from "../utils/vault.js";
 import { moveToTrash } from "../utils/trash.js";
 import * as z from "zod";
 import { scheduleHiveRegen } from "./hive-auto-regen.js";
+import { eventBus } from "../utils/event-bus.js";
 
 export const name = "delete_folder";
 export const description =
@@ -39,11 +40,23 @@ export async function handler({
     if (permanent) {
         await rm(fullPath, { recursive, force: true });
         scheduleHiveRegen(path);
+        eventBus.emitAsync({
+            type: "folder_deleted",
+            path,
+            timestamp: new Date().toISOString(),
+            metadata: { permanent: true },
+        });
         return { content: [{ type: "text" as const, text: `Folder permanently deleted: "${path}".` }] };
     }
 
     await moveToTrash(fullPath);
     scheduleHiveRegen(path);
+    eventBus.emitAsync({
+        type: "folder_deleted",
+        path,
+        timestamp: new Date().toISOString(),
+        metadata: { permanent: false, trashed: true },
+    });
     return {
         content: [
             {

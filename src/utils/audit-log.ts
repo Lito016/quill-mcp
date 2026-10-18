@@ -135,8 +135,15 @@ export async function queryAuditLog(filter: AuditFilter): Promise<AuditEntry[]> 
         entries = entries.filter((e) => e.timestamp <= filter.to!);
     }
 
-    // Most recent first
-    entries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    // Most recent first; ties (same-millisecond timestamps) broken by insertion
+    // order so the result is deterministic for rapid successive writes
+    entries
+        .map((entry, index) => ({ entry, index }))
+        .sort((a, b) => b.entry.timestamp.localeCompare(a.entry.timestamp) || b.index - a.index)
+        .map(({ entry }) => entry)
+        .forEach((entry, index) => {
+            entries[index] = entry;
+        });
 
     const limit = filter.limit ?? 50;
     return entries.slice(0, limit);

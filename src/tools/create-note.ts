@@ -4,6 +4,7 @@ import { pathExists, safeWriteTarget, safeReadTarget } from "../utils/vault.js";
 import { recordMutation } from "../utils/session-tracker.js";
 import { parseFrontmatter, stringifyFrontmatter } from "../utils/frontmatter.js";
 import { scheduleHiveRegen } from "./hive-auto-regen.js";
+import { eventBus } from "../utils/event-bus.js";
 import * as z from "zod";
 
 export const name = "create_note";
@@ -119,5 +120,11 @@ export async function handler({
     await writeFile(fullPath, finalContent, "utf-8");
     await recordMutation({ type: "create", path: resolvedPath });
     scheduleHiveRegen(resolvedPath);
+    eventBus.emitAsync({
+        type: "note_created",
+        path: resolvedPath,
+        timestamp: new Date().toISOString(),
+        metadata: { size: Buffer.byteLength(finalContent, "utf-8"), tags: tags ?? [] },
+    });
     return { content: [{ type: "text" as const, text: `Note created at "${resolvedPath}".` }] };
 }

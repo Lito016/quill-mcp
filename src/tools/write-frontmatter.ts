@@ -1,5 +1,6 @@
 ﻿import { readFile, writeFile } from "node:fs/promises";
-import { pathExists, safeWriteTarget } from "../utils/vault.js";
+import { pathExists, safeWriteTarget, invalidateReadCache } from "../utils/vault.js";
+import { invalidateGraphCache } from "../utils/graph-cache.js";
 import { parseFrontmatter, stringifyFrontmatter } from "../utils/frontmatter.js";
 import * as z from "zod";
 import { scheduleHiveRegen } from "./hive-auto-regen.js";
@@ -25,6 +26,8 @@ export async function handler({ path, frontmatter }: { path: string; frontmatter
 
     await writeFile(fullPath, newContent, "utf-8");
 
+    invalidateReadCache(fullPath);
+    invalidateGraphCache();
     scheduleHiveRegen(path);
     return { content: [{ type: "text" as const, text: `Frontmatter updated in "${path}".` }] };
 }

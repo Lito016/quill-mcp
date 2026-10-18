@@ -60,7 +60,7 @@ describe("generate_hive_canvas handler", () => {
         const jsonContent = await readFile(jsonPath, "utf-8");
         const parsed = JSON.parse(jsonContent);
         expect(parsed.title).toBe("Vault Knowledge Graph");
-        expect(parsed.schemaVersion).toBe(3);
+        expect(parsed.schemaVersion).toBe(4);
         expect(parsed.nodes).toBeDefined();
         expect(parsed.links).toBeDefined();
         expect(parsed.stats).toBeDefined();

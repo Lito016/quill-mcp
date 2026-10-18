@@ -1,155 +1,139 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdir, rm, writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { initVault } from "./vault.js";
 import { searchIndex } from "./search-index.js";
 
-const TEST_VAULT = join(process.cwd(), "test-vault-search-temp");
+const TEST_VAULT = join(process.cwd(), "test-vault-temp-search-index");
 
-describe("SearchIndex", () => {
-    beforeAll(async () => {
-        // Create a temp vault with sample markdown files
-        await mkdir(join(TEST_VAULT, "notes"), { recursive: true });
-        await mkdir(join(TEST_VAULT, "templates"), { recursive: true });
-
-        await writeFile(
-            join(TEST_VAULT, "notes", "meeting-notes.md"),
-            [
-                "---",
-                "title: Weekly Meeting Notes",
-                "tags: [meetings, weekly]",
-                "category: notes",
-                "---",
-                "",
-                "# Weekly Meeting",
-                "",
-                "Discussed project timeline and deliverables.",
-                "Action items assigned to the development team.",
-            ].join("\n"),
-        );
-
-        await writeFile(
-            join(TEST_VAULT, "notes", "architecture.md"),
-            [
-                "---",
-                "title: System Architecture",
-                "tags: [architecture, design, technical]",
-                "category: reference",
-                "---",
-                "",
-                "# Architecture Overview",
-                "",
-                "The system uses a microservices architecture.",
-                "Each service communicates via REST APIs.",
-            ].join("\n"),
-        );
-
-        await writeFile(
-            join(TEST_VAULT, "templates", "PRD_TEMPLATE.md"),
-            [
-                "---",
-                "title: PRD Template - Product Requirements",
-                "tags: [prd, template, product-requirements]",
-                "category: template",
-                "phase: define",
-                "---",
-                "",
-                "# Product Requirements Document",
-                "",
-                "## Executive Summary",
-                "Describe the product vision and goals.",
-            ].join("\n"),
-        );
-
-        // Initialise vault with the temp directory
-        process.argv = ["node", "index.js", TEST_VAULT];
+describe("SearchIndex precise invalidation", () => {
+    beforeEach(async () => {
+        await rm(TEST_VAULT, { recursive: true, force: true });
+        await mkdir(TEST_VAULT, { recursive: true });
+        await writeFile(join(TEST_VAULT, "alpha.md"), "alpha content with shareword", "utf-8");
+        process.env.NOTES_VAULT_PATH = TEST_VAULT;
+        delete process.argv[2];
         initVault();
         searchIndex.markDirty();
         await searchIndex.ensureSynchronized();
     });
 
-    afterAll(async () => {
+    afterEach(async () => {
+        delete process.env.NOTES_VAULT_PATH;
         await rm(TEST_VAULT, { recursive: true, force: true });
     });
 
-    it("indexes documents from the vault", () => {
-        const docs = searchIndex.getDocuments();
-        expect(docs.length).toBe(3);
+    it("should index documents for lookup", () => {
+        expect(searchIndex.getDocument("alpha.md")).toBeDefined();
     });
 
-    it("each document has required fields", () => {
-        const docs = searchIndex.getDocuments();
-        const doc = docs.find((d) => d.filename === "meeting-notes.md");
-        expect(doc).toBeDefined();
-        expect(doc!.path).toBe("notes/meeting-notes.md");
-        expect(doc!.lines.length).toBeGreaterThan(0);
-        expect(doc!.tokenCount).toBeGreaterThan(0);
-        expect(doc!.termFreq).toBeInstanceOf(Map);
+    it("should drop a deleted document and its postings on precise invalidation", async () => {
+        await unlink(join(TEST_VAULT, "alpha.md"));
+        searchIndex.invalidatePath("alpha.md");
+        await searchIndex.ensureSynchronized();
+
+        expect(searchIndex.getDocument("alpha.md")).toBeUndefined();
+        // No orphan inverted entries left behind
+        expect(searchIndex.getInvertedIndex().get("alpha")).toBeUndefined();
+        expect(searchIndex.getInvertedIndex().get("shareword")).toBeUndefined();
     });
 
-    it("extracts frontmatter tags", () => {
-        const docs = searchIndex.getDocuments();
-        const doc = docs.find((d) => d.filename === "meeting-notes.md");
-        expect(doc).toBeDefined();
-        expect(doc!.tags).toContain("meetings");
-        expect(doc!.tags).toContain("weekly");
+    it("should re-index an edited document on precise invalidation", async () => {
+        await writeFile(join(TEST_VAULT, "alpha.md"), "brandnewtoken body", "utf-8");
+        searchIndex.invalidatePath("alpha.md");
+        await searchIndex.ensureSynchronized();
+
+        const doc = searchIndex.getDocument("alpha.md");
+        expect(doc?.termFreq.get("brandnewtoken")).toBe(1);
+        expect(doc?.termFreq.get("shareword")).toBeUndefined();
+        expect(searchIndex.getInvertedIndex().get("shareword")).toBeUndefined();
     });
 
-    it("extracts frontmatter title", () => {
-        const docs = searchIndex.getDocuments();
-        const doc = docs.find((d) => d.filename === "architecture.md");
-        expect(doc).toBeDefined();
-        expect(doc!.title).toBe("System Architecture");
+    it("should resolve invalidated paths case-insensitively without duplicating keys", async () => {
+        searchIndex.invalidatePath("ALPHA.MD");
+        await searchIndex.ensureSynchronized();
+
+        const paths = searchIndex.getDocuments().map((doc) => doc.path);
+        expect(paths).toEqual(["alpha.md"]);
     });
 
-    it("builds an inverted index with all terms", () => {
-        const terms = searchIndex.getAllTerms();
-        expect(terms.length).toBeGreaterThan(0);
-        // Terms should be lowercase
-        expect(terms.every((t) => t === t.toLowerCase())).toBe(true);
-        // Should contain known terms from our test files
-        expect(terms).toContain("meeting");
-        expect(terms).toContain("architecture");
-    });
+    it("should treat unchanged paths as no-ops during precise invalidation", async () => {
+        const before = searchIndex.getDocument("alpha.md")?.modified;
+        searchIndex.invalidatePath("alpha.md");
+        await searchIndex.ensureSynchronized();
 
-    it("BM25 score is 0 for non-matching tokens", () => {
-        const docs = searchIndex.getDocuments();
-        const doc = docs.find((d) => d.filename === "meeting-notes.md")!;
-        const score = searchIndex.bm25Score(doc, ["zzzznonexistent"]);
-        expect(score).toBe(0);
+        expect(searchIndex.getDocument("alpha.md")?.modified).toBe(before);
     });
+});
 
-    it("BM25 score is positive for matching tokens", () => {
-        const docs = searchIndex.getDocuments();
-        const doc = docs.find((d) => d.filename === "meeting-notes.md")!;
-        const score = searchIndex.bm25Score(doc, ["meeting"]);
-        expect(score).toBeGreaterThan(0);
-    });
-
-    it("BM25 ranks documents with more relevant content higher", () => {
-        const docs = searchIndex.getDocuments();
-        const meeting = docs.find((d) => d.filename === "meeting-notes.md")!;
-        const arch = docs.find((d) => d.filename === "architecture.md")!;
-        const scoreMeeting = searchIndex.bm25Score(meeting, ["meeting"]);
-        const scoreArch = searchIndex.bm25Score(arch, ["meeting"]);
-        expect(scoreMeeting).toBeGreaterThan(scoreArch);
-    });
-
-    it("suggestCorrection returns a close term for typos", () => {
-        // "meting" should suggest "meeting" (1 edit, tolerance for 6-char word = 1)
-        const suggestion = searchIndex.suggestCorrection("meting");
-        expect(suggestion).toBe("meeting");
-    });
-
-    it("suggestCorrection returns undefined for gibberish", () => {
-        const suggestion = searchIndex.suggestCorrection("xyzxyzxyzxyzxyz");
-        expect(suggestion).toBeUndefined();
-    });
-
-    it("markDirty forces re-index on next ensureSynchronized", async () => {
+describe("SearchIndex scoring, metadata and dirty rebuild", () => {
+    beforeEach(async () => {
+        await rm(TEST_VAULT, { recursive: true, force: true });
+        await mkdir(join(TEST_VAULT, "notes"), { recursive: true });
+        await writeFile(
+            join(TEST_VAULT, "notes", "meeting-notes.md"),
+            "---\ntitle: Meeting Notes\ntags: [#Product, Review]\n---\nMeeting agenda for the product sync.\nMeeting minutes will be recorded.\nMeeting adjourned.",
+            "utf-8",
+        );
+        await writeFile(
+            join(TEST_VAULT, "notes", "architecture.md"),
+            "# Architecture\n\nSystem diagram and component overview with meeting cadence.",
+            "utf-8",
+        );
+        process.env.NOTES_VAULT_PATH = TEST_VAULT;
+        delete process.argv[2];
+        initVault();
         searchIndex.markDirty();
         await searchIndex.ensureSynchronized();
-        const docs = searchIndex.getDocuments();
-        expect(docs.length).toBe(3);
+    });
+
+    afterEach(async () => {
+        delete process.env.NOTES_VAULT_PATH;
+        await rm(TEST_VAULT, { recursive: true, force: true });
+    });
+
+    it("should score absent query terms as zero in BM25", () => {
+        const doc = searchIndex.getDocument("notes/meeting-notes.md");
+        expect(doc).toBeDefined();
+        expect(searchIndex.bm25Score(doc!, ["missingterm"])).toBe(0);
+    });
+
+    it("should rank documents with more term occurrences higher", () => {
+        const frequent = searchIndex.getDocument("notes/meeting-notes.md");
+        const sparse = searchIndex.getDocument("notes/architecture.md");
+        expect(frequent).toBeDefined();
+        expect(sparse).toBeDefined();
+        expect(searchIndex.bm25Score(frequent!, ["meeting"])).toBeGreaterThan(
+            searchIndex.bm25Score(sparse!, ["meeting"]),
+        );
+    });
+
+    it("should extract normalised tags and title from frontmatter", () => {
+        const doc = searchIndex.getDocument("notes/meeting-notes.md");
+        expect(doc?.tags).toEqual(["product", "review"]);
+        expect(doc?.title).toBe("Meeting Notes");
+    });
+
+    it("should suggest the closest indexed term for typo queries", () => {
+        expect(searchIndex.suggestCorrection("meting")).toBe("meeting");
+        expect(searchIndex.suggestCorrection("zzzzzzz")).toBeUndefined();
+    });
+
+    it("should rebuild from scratch after markDirty, pruning deletions", async () => {
+        await unlink(join(TEST_VAULT, "notes", "architecture.md"));
+        await writeFile(join(TEST_VAULT, "notes", "extra.md"), "freshtoken content", "utf-8");
+        searchIndex.markDirty();
+        await searchIndex.ensureSynchronized();
+
+        expect(searchIndex.getDocument("notes/extra.md")?.termFreq.get("freshtoken")).toBe(1);
+        expect(searchIndex.getDocument("notes/architecture.md")).toBeUndefined();
+        expect(searchIndex.getInvertedIndex().get("architecture")).toBeUndefined();
+    });
+
+    it("should map every indexed token to its document paths", () => {
+        expect(searchIndex.getInvertedIndex().get("meeting")).toEqual(
+            new Set(["notes/meeting-notes.md", "notes/architecture.md"]),
+        );
+        expect(searchIndex.getAllTerms()).toContain("meeting");
     });
 });

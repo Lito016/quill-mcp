@@ -1,4 +1,64 @@
 /**
+ * Parse only the frontmatter from a file without reading the entire body.
+ * Reads at most `maxBytes` (default 4096) from the start of the file,
+ * which is sufficient for virtually all frontmatter blocks.
+ *
+ * Correctness guarantees:
+ * - Searches for `\n---` (not bare `---`) to match the full parser's regex.
+ * - If the closing delimiter is not found, falls back to reading the full file.
+ * - If the buffer cuts mid-UTF8-sequence, falls back to the full file.
+ * - Never returns incomplete or divergent metadata.
+ */
+export async function parseFrontmatterPartial(
+    filePath: string,
+    maxBytes = 4096,
+): Promise<{ frontmatter: Record<string, unknown> }> {
+    const { open, readFile } = await import("node:fs/promises");
+    let fh;
+    try {
+        fh = await open(filePath, "r");
+        const { size } = await fh.stat();
+        const toRead = Math.min(maxBytes, size);
+        const buf = Buffer.alloc(toRead);
+        await fh.read(buf, 0, toRead, 0);
+
+        // UTF-8 boundary guard: if the buffer ends mid-character, the decoded
+        // string will have a replacement char (U+FFFD) at the tail. In that
+        // case the closing delimiter might be just past the buffer — fall back.
+        const partial = buf.toString("utf-8");
+        if (partial.charCodeAt(partial.length - 1) === 0xfffe) {
+            // Incomplete multi-byte sequence at buffer boundary — full read
+            const full = await readFile(filePath, "utf-8");
+            const { frontmatter } = parseFrontmatter(full);
+            return { frontmatter };
+        }
+
+        // Find opening delimiter
+        const firstDelim = partial.indexOf("---");
+        if (firstDelim === -1) return { frontmatter: {} };
+
+        // Search for closing delimiter: must be preceded by a newline to match
+        // the full parser's regex `\n---`. Searching for bare `---` would
+        // produce false positives on `---` embedded in content lines.
+        const searchFrom = firstDelim + 3;
+        const closingIdx = partial.indexOf("\n---", searchFrom);
+        if (closingIdx === -1) {
+            // Closing delimiter not in buffer — fall back to full file
+            const full = await readFile(filePath, "utf-8");
+            const { frontmatter } = parseFrontmatter(full);
+            return { frontmatter };
+        }
+
+        // We have both delimiters — parse just the frontmatter portion
+        const fmContent = partial.slice(0, closingIdx + 1 + 3); // include \n---
+        const { frontmatter } = parseFrontmatter(fmContent + "\n");
+        return { frontmatter };
+    } finally {
+        await fh?.close();
+    }
+}
+
+/**
  * Parse YAML frontmatter from markdown content.
  * Supports nested objects (one level), inline objects, arrays, and multi-line arrays.
  * Returns the frontmatter object and the content without frontmatter.

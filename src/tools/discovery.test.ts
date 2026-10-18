@@ -3,11 +3,13 @@ import { mkdir, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { initVault } from "../utils/vault.js";
 import { knowledgeIndex } from "../utils/knowledge-index.js";
+import { searchIndex } from "../utils/search-index.js";
 import { handler as discover } from "./discover.js";
 import { handler as searchFiles } from "./search-files.js";
 import { handler as searchByTag } from "./search-by-tag.js";
 import { handler as listFolder } from "./list-folder.js";
 import { handler as searchNotes } from "./search-notes.js";
+import { handler as searchByName } from "./search-by-name.js";
 
 const TEST_VAULT = join(process.cwd(), "test-vault-temp-discovery");
 const json = (result: Awaited<ReturnType<typeof discover>>) => JSON.parse(result.content[0].text);
@@ -188,10 +190,62 @@ describe("knowledge discovery", () => {
             path: ".",
             fileExtension: ".md",
             useRegex: false,
+            fuzzy: false,
+            highlight: false,
+            sort: "relevance",
+            snippets: 0,
+            frontmatter_only: false,
+            deduplicate: false,
+            wildcard: false,
             limit: 10,
             offset: 0,
             showTokenEstimate: false,
         });
         expect(result.content[0].text).toContain("deep.md");
+    });
+
+    it("offers did-you-mean suggestions on zero-result typo queries", async () => {
+        const body = json(await discover({ query: "prr" }));
+        expect(body.results).toHaveLength(0);
+        expect(body.suggestion).toBe("prd");
+    });
+
+    it("restricts search_notes to the requested folder without prefix collisions", async () => {
+        await mkdir(join(TEST_VAULT, "Projects"), { recursive: true });
+        await mkdir(join(TEST_VAULT, "ProjectsX"), { recursive: true });
+        await writeFile(join(TEST_VAULT, "Projects", "a.md"), "needlebound here", "utf-8");
+        await writeFile(join(TEST_VAULT, "ProjectsX", "b.md"), "needlebound here", "utf-8");
+        // Queue the new files through the precise invalidation path
+        searchIndex.invalidatePath("Projects/a.md");
+        searchIndex.invalidatePath("ProjectsX/b.md");
+        await searchIndex.ensureSynchronized();
+        const result = await searchNotes({
+            query: "needlebound",
+            path: "Projects",
+            fileExtension: ".md",
+            useRegex: false,
+            fuzzy: false,
+            highlight: false,
+            sort: "relevance",
+            snippets: 0,
+            frontmatter_only: false,
+            deduplicate: false,
+            wildcard: false,
+            offset: 0,
+            showTokenEstimate: false,
+        });
+        const text = result.content[0].text;
+        expect(text).toContain("Projects/a.md");
+        expect(text).not.toContain("ProjectsX/b.md");
+    });
+
+    it("never matches filenames inside internal directories", async () => {
+        await mkdir(join(TEST_VAULT, "node_modules", "fake-pkg"), { recursive: true });
+        await writeFile(join(TEST_VAULT, "node_modules", "fake-pkg", "target-name.md"), "dep", "utf-8");
+        await writeFile(join(TEST_VAULT, "other", "target-name.md"), "real note", "utf-8");
+        const result = await searchByName({ pattern: "target-name", path: ".", recursive: true });
+        const text = result.content[0].text;
+        expect(text).toContain("other/target-name.md");
+        expect(text).not.toContain("node_modules");
     });
 });

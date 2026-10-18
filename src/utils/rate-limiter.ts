@@ -55,6 +55,14 @@ const TOOL_CATEGORIES: Record<string, string> = {
     quill_recall: "read",
     quill_audit: "read",
     watch_changes: "read",
+    vault_guide: "read",
+    health_check: "read",
+    graph_neighborhood: "read",
+    vault_health_audit: "read",
+    note_undo: "read",
+    batch_read: "read",
+    preview_changes: "read",
+    apply_change_plan: "write",
 
     search_notes: "search",
     quill_detect_conflicts: "search",
@@ -81,12 +89,20 @@ const TOOL_CATEGORIES: Record<string, string> = {
     quill_session_end: "write",
     generate_hive_canvas: "write",
     refresh_knowledge_index: "write",
+    note_sections: "write", // Can replace section content
 
     batch_delete: "batch",
     batch_move: "batch",
 
     quill_consolidate: "memory",
     quill_restore: "memory",
+
+    subscribe_webhook: "write",
+    list_webhooks: "read",
+    delete_webhook: "write",
+    test_webhook: "write",
+    trigger_webhook: "write",
+    emit_event: "write",
 };
 
 interface SlidingWindow {

@@ -1,8 +1,8 @@
 ﻿import { resolveVaultPath, pathExists, getVaultRoot, safeWriteTarget } from "../utils/vault.js";
 import { scanVaultNotes, VaultNode, VaultEdge } from "../utils/graph.js";
 import { extractTags, parseFrontmatter } from "../utils/frontmatter.js";
-import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
-import { dirname, relative, resolve } from "node:path";
+import { readFile, writeFile, mkdir, stat, readdir } from "node:fs/promises";
+import { dirname, relative, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractLinks } from "../utils/links.js";
 import * as z from "zod";
@@ -30,41 +30,25 @@ export const inputSchema = z.object({
         ),
 });
 
-/* ── colour palette for groups ─────────────────────────────────── */
+/* ── colour palette: Graphite console with blue accent ─────────── */
 
-const PALETTE = [
-    "#38bdf8",
-    "#34d399",
-    "#fb7185",
-    "#fbbf24",
-    "#818cf8",
-    "#f472b6",
-    "#2dd4bf",
-    "#fb923c",
-    "#a3e635",
-    "#60a5fa",
-    "#c084fc",
-    "#4ade80",
-    "#f87171",
-    "#facc15",
-    "#22d3ee",
-    "#e879f9",
-    "#a78bfa",
-    "#38bdf8",
-    "#f97316",
-    "#14b8a6",
-    "#6366f1",
-    "#ec4899",
-    "#84cc16",
-    "#06b6d4",
-    "#ef4444",
-    "#8b5cf6",
-    "#10b981",
-    "#f59e0b",
-];
+const PALETTE = {
+    core: "#2f5fe3", // Primary blue accent
+    agent: "#4f7cff", // Lighter blue for agents
+    domain: "#374151", // Dark graphite for domains
+    skill: "#6b7280", // Medium graphite for skills
+    reference: "#9ca3af", // Light graphite for references
+    concept: "#64748b", // Slate for concepts
+    folder: "#4b5563", // Medium-dark graphite for folder hubs
+    status: {
+        active: "#10b981", // Green
+        warning: "#f59e0b", // Amber
+        error: "#ef4444", // Red
+    },
+};
 
-function colorForIndex(index: number): string {
-    return PALETTE[index % PALETTE.length];
+function colorForKind(kind: CanvasNode["kind"]): string {
+    return PALETTE[kind] ?? PALETTE.reference;
 }
 
 /* ── types ─────────────────────────────────────────────────────── */
@@ -73,11 +57,13 @@ interface CanvasNode {
     id: string;
     label: string;
     short: string;
-    kind: "core" | "agent" | "domain" | "skill" | "reference" | "concept";
+    kind: "core" | "agent" | "domain" | "folder" | "skill" | "reference" | "concept";
     group: string;
     path: string;
     description: string;
     triggers?: string[];
+    size?: "lg" | "md" | "sm"; // Visual size hint for renderer
+    importance?: number; // 0-100, guides layout priority
 }
 
 interface CanvasLink {
@@ -291,7 +277,7 @@ function classifyNote(
 /* ── edge classification helper ────────────────────────────────── */
 
 interface EdgeNodeClass {
-    kind: "core" | "agent" | "domain" | "skill" | "reference" | "concept";
+    kind: "core" | "agent" | "domain" | "folder" | "skill" | "reference" | "concept";
     group: string;
     skillName: string;
 }
@@ -415,8 +401,50 @@ export async function generateCanvas(
             hiveNode?.id === "plugin/HIVE-MIND"
                 ? "Shared graph memory and routing hub"
                 : "Shared vault memory and routing hub",
+        size: "lg",
+        importance: 100,
     });
     nodeIds.add("hive");
+
+    // Scan top-level vault directories and create folder nodes
+    const vaultRoot = getVaultRoot();
+    const excludedDirs = new Set([".trash", ".versions", ".embeddings", ".quill", ".quill-sessions", "node_modules", "canvases"]);
+    try {
+        const vaultEntries = await readdir(vaultRoot, { withFileTypes: true });
+        for (const entry of vaultEntries) {
+            if (!entry.isDirectory()) continue;
+            const dirName = entry.name;
+            if (excludedDirs.has(dirName) || dirName.startsWith(".")) continue;
+            
+            const folderId = `folder:${dirName}`;
+            if (nodeIds.has(folderId)) continue;
+            nodeIds.add(folderId);
+            
+            // Count files in directory
+            const dirPath = resolve(vaultRoot, dirName);
+            let fileCount = 0;
+            try {
+                const entries = await readdir(dirPath, { withFileTypes: true, recursive: false });
+                fileCount = entries.length;
+            } catch {
+                fileCount = 0;
+            }
+            
+            canvasNodes.push({
+                id: folderId,
+                label: titleCase(dirName),
+                short: shortName(dirName),
+                kind: "folder",
+                group: dirName.toLowerCase().replace(/[^a-z0-9]/g, "-"),
+                path: dirName,
+                description: `Vault directory — ${fileCount} items`,
+                size: "md",
+                importance: 70,
+            });
+        }
+    } catch {
+        // If we can't read vault root, skip folder scanning
+    }
 
     // Agent nodes
     if (usesPlugin) {
@@ -430,6 +458,8 @@ export async function generateCanvas(
                 group: "prime",
                 path: info.path,
                 description: info.description,
+                size: "md",
+                importance: 80,
             });
             nodeIds.add(agentId);
         }
@@ -462,6 +492,8 @@ export async function generateCanvas(
             group,
             path: node.path,
             description,
+            size: kind === "domain" ? "md" : "sm",
+            importance: kind === "domain" ? 60 : kind === "skill" ? 40 : 20,
         };
         if (triggers.length > 0) {
             canvasNode.triggers = triggers;
@@ -488,6 +520,8 @@ export async function generateCanvas(
                     group: "concept",
                     path: "",
                     description: "Relationship target without a matching routable skill",
+                    size: "sm",
+                    importance: 10,
                 });
                 warnings++;
             }
@@ -505,11 +539,56 @@ export async function generateCanvas(
     };
     const usedGroups = [...new Set(canvasNodes.map((node) => node.group))];
     if (!usedGroups.includes("concept")) usedGroups.push("concept");
-    const groups: { id: string; label: string; color: string }[] = usedGroups.sort().map((group, index) => ({
-        id: group,
-        label: groupLabels[group] ?? titleCase(group.replace(/^notes-/, "").replace(/^memories-/, "")),
-        color: group === "core" ? "#a78bfa" : group === "concept" ? "#64748b" : colorForIndex(index),
-    }));
+    const groups: { id: string; label: string; color: string }[] = usedGroups.sort().map((group) => {
+        // Determine color from the dominant kind in this group
+        const groupNodes = canvasNodes.filter((n) => n.group === group);
+        const dominantKind = groupNodes.length > 0 ? groupNodes[0].kind : "reference";
+        return {
+            id: group,
+            label: groupLabels[group] ?? titleCase(group.replace(/^notes-/, "").replace(/^memories-/, "")),
+            color: colorForKind(dominantKind),
+        };
+    });
+
+    // 3b. Folder hub detection — group reference nodes by parent folder
+    const folderChildren = new Map<string, CanvasNode[]>();
+    for (const node of canvasNodes) {
+        if (node.kind !== "reference" || !node.path) continue;
+        const parentDir = dirname(node.path).replace(/\\/g, "/");
+        const parts = parentDir.split("/");
+        if (parts.length <= 1) continue; // root-level notes connect directly to domain
+        const folderKey = `${node.group}:${parentDir}`;
+        if (!folderChildren.has(folderKey)) folderChildren.set(folderKey, []);
+        folderChildren.get(folderKey)!.push(node);
+    }
+
+    // Create folder hub nodes for folders with 2+ children
+    const folderHubIds = new Set<string>();
+    const nodeToFolderHub = new Map<string, string>();
+    for (const [folderKey, children] of folderChildren) {
+        if (children.length < 2) continue;
+        const [group, ...dirParts] = folderKey.split(":");
+        const folderDir = dirParts.join(":");
+        const folderName = folderDir.split("/").pop() ?? folderDir;
+        const folderId = `folder:${folderDir.replace(/\//g, "-")}`;
+        if (nodeIds.has(folderId)) continue;
+        nodeIds.add(folderId);
+        folderHubIds.add(folderId);
+        canvasNodes.push({
+            id: folderId,
+            label: titleCase(folderName),
+            short: shortName(folderName),
+            kind: "folder",
+            group,
+            path: folderDir,
+            description: `Folder hub — ${children.length} notes`,
+            size: "md",
+            importance: 45,
+        });
+        for (const child of children) {
+            nodeToFolderHub.set(child.id, folderId);
+        }
+    }
 
     // 4. Build links
     const canvasLinks: CanvasLink[] = [];
@@ -546,16 +625,52 @@ export async function generateCanvas(
                 group,
                 path: "",
                 description: `Hub for ${label}`,
+                size: "md",
+                importance: 60,
             });
             nodeIds.add(domainId);
         }
         canvasLinks.push({ source: "hive", target: domainId, type: "knowledge" });
     }
 
+    // Hub → top-level folders
     for (const node of canvasNodes) {
-        if (node.kind === "core" || node.kind === "domain" || node.kind === "concept") continue;
-        const domainId = `domain:${node.group}`;
-        if (nodeIds.has(domainId)) canvasLinks.push({ source: domainId, target: node.id, type: "member" });
+        if (node.kind === "folder" && node.path && !node.path.includes("/")) {
+            canvasLinks.push({ source: "hive", target: node.id, type: "structure" });
+        }
+    }
+
+    // Reference → folder hub (if exists) or domain
+    for (const node of canvasNodes) {
+        if (node.kind === "core" || node.kind === "domain" || node.kind === "concept" || node.kind === "folder") continue;
+        const folderHubId = nodeToFolderHub.get(node.id);
+        if (folderHubId && nodeIds.has(folderHubId)) {
+            canvasLinks.push({ source: folderHubId, target: node.id, type: "member" });
+        } else {
+            // Check if there's a top-level folder matching the note's path
+            const notePath = node.path;
+            if (notePath) {
+                const topLevelDir = notePath.split("/")[0];
+                const topLevelFolderId = `folder:${topLevelDir}`;
+                if (nodeIds.has(topLevelFolderId)) {
+                    canvasLinks.push({ source: topLevelFolderId, target: node.id, type: "member" });
+                    continue;
+                }
+            }
+            // Fall back to domain
+            const domainId = `domain:${node.group}`;
+            if (nodeIds.has(domainId)) canvasLinks.push({ source: domainId, target: node.id, type: "member" });
+        }
+    }
+
+    // Folder hub → domain
+    for (const folderId of folderHubIds) {
+        const folderNode = canvasNodes.find((n) => n.id === folderId);
+        if (!folderNode) continue;
+        const domainId = `domain:${folderNode.group}`;
+        if (nodeIds.has(domainId)) {
+            canvasLinks.push({ source: domainId, target: folderId, type: "member" });
+        }
     }
 
     // Edge-based links
@@ -647,7 +762,7 @@ export async function generateCanvas(
     const canvasData: CanvasData = {
         title: "Vault Knowledge Graph",
         subtitle: "An interactive map of the vault knowledge graph",
-        schemaVersion: 3,
+        schemaVersion: 4,
         groups,
         nodes: canvasNodes,
         links: uniqueLinks,
@@ -668,7 +783,9 @@ export async function generateCanvas(
         const template = await readFile(tsxPath, "utf-8");
         const vaultRoot = getVaultRoot().replace(/\\/g, "/");
         // Replace any hardcoded VAULT_ROOT placeholder with the configured vault path
-        const tsxContent = `"use client";\n\nimport { useMemo, useRef, useState } from "react";\nimport type { MouseEvent as ReactMouseEvent, WheelEvent } from "react";\nimport { ReportShell } from "qoder/canvas";\nconst hiveData = ${JSON.stringify(canvasData, null, 4)};\n${template.replace(/__VAULT_ROOT__/, vaultRoot)}`;
+        // Strip @ts-nocheck directives from template (only needed for standalone IDE editing)
+        const cleanedTemplate = template.replace(/\/\/ @ts-nocheck[^\n]*\n?/g, "");
+        const tsxContent = `"use client";\n\nimport { useMemo, useRef, useState } from "react";\nimport type { MouseEvent as ReactMouseEvent, WheelEvent } from "react";\nimport { ReportShell } from "qoder/canvas";\nconst hiveData = ${JSON.stringify(canvasData, null, 4)};\n${cleanedTemplate.replace(/__VAULT_ROOT__/, vaultRoot)}`;
         // Derive TSX output path and validate it independently
         const tsxOutputPath = resolvedOutputPath.replace(/\.json$/, ".tsx");
         // Ensure TSX path is different from JSON path (no collision)

@@ -4,6 +4,7 @@ import { moveToTrash } from "../utils/trash.js";
 import { join } from "node:path";
 import * as z from "zod";
 import { scheduleHiveRegen } from "./hive-auto-regen.js";
+import { eventBus } from "../utils/event-bus.js";
 
 export const name = "delete_note";
 export const description =
@@ -48,11 +49,23 @@ export async function handler({ path, permanent, dry_run }: { path: string; perm
         if (permanent) {
             await unlink(fullPath);
             scheduleHiveRegen(path);
+            eventBus.emitAsync({
+                type: "note_deleted",
+                path,
+                timestamp: new Date().toISOString(),
+                metadata: { permanent: true },
+            });
             return { content: [{ type: "text" as const, text: `Note permanently deleted: "${path}".` }] };
         }
 
         await moveToTrash(fullPath);
         scheduleHiveRegen(path);
+        eventBus.emitAsync({
+            type: "note_deleted",
+            path,
+            timestamp: new Date().toISOString(),
+            metadata: { permanent: false, trashed: true },
+        });
         return {
             content: [
                 {
@@ -137,7 +150,7 @@ async function globMatch(pattern: string): Promise<string[]> {
         try {
             const entries = await readdir(dir, { withFileTypes: true });
             for (const entry of entries) {
-                if (entry.name === ".trash" || entry.name === ".quill-sessions") continue;
+                if (entry.name === ".trash" || entry.name === ".quill-sessions" || entry.name === ".versions") continue;
                 const entryPath = join(dir, entry.name);
                 // Symlink defense: never recurse into symbolic links
                 const entryStat = await lstat(entryPath);
