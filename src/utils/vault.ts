@@ -1,6 +1,6 @@
 import { resolve, relative, isAbsolute, join, dirname, normalize } from "node:path";
 import { access, stat, realpath, lstat, readdir, readFile, open, writeFile as fsWriteFile, rename } from "node:fs/promises";
-import { constants, readFileSync, existsSync } from "node:fs";
+import { constants, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { config as loadDotenv } from "dotenv";
 import { fileURLToPath } from "node:url";
@@ -286,13 +286,53 @@ function getProjectRoot(): string {
 }
 
 /**
+ * Default subdirectories created inside every vault on first init.
+ * Internal dirs (dot-prefixed) power quill-mcp features.
+ * User dirs provide a sensible starting layout.
+ */
+const DEFAULT_VAULT_DIRS = [
+    ".quill",
+    ".trash",
+    ".versions",
+    ".quill-sessions",
+    "notes",
+    "tasks",
+    "daily",
+    "knowledge",
+    "canvases",
+];
+
+/**
  * Initialize the vault root from available configuration sources.
+ * Creates the vault directory and default subdirectories if they don't exist.
  */
 export function initVault(): string {
     vaultRoot = resolveVaultRoot();
+    ensureVaultStructure(vaultRoot);
     invalidateVaultReal();
     invalidateReadCache();
     return vaultRoot;
+}
+
+/**
+ * Ensure the vault root and its default subdirectories exist.
+ * Safe to call on every startup — skips directories that already exist.
+ */
+function ensureVaultStructure(root: string): void {
+    let created = false;
+    if (!existsSync(root)) {
+        mkdirSync(root, { recursive: true });
+        created = true;
+    }
+    for (const dir of DEFAULT_VAULT_DIRS) {
+        const full = join(root, dir);
+        if (!existsSync(full)) {
+            mkdirSync(full, { recursive: true });
+        }
+    }
+    if (created) {
+        logger.info("Created new vault with default structure", { path: root, dirs: DEFAULT_VAULT_DIRS });
+    }
 }
 
 /**

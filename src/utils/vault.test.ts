@@ -506,4 +506,35 @@ describe("Vault Utilities", () => {
             expect(() => resolveVaultPath("/usr/local/bin")).toThrow("Path traversal blocked");
         });
     });
+
+    describe("initVault: auto-creation", () => {
+        it("should create vault root and default dirs when vault does not exist", async () => {
+            const freshVault = join(process.cwd(), "test-vault-fresh");
+            await rm(freshVault, { recursive: true, force: true });
+
+            process.argv = ["node", "index.js", freshVault];
+            const result = initVault();
+
+            expect(result).toBe(freshVault);
+            expect(await pathExists(freshVault)).toBe(true);
+            expect(await pathExists(join(freshVault, ".quill"))).toBe(true);
+            expect(await pathExists(join(freshVault, ".trash"))).toBe(true);
+            expect(await pathExists(join(freshVault, ".versions"))).toBe(true);
+            expect(await pathExists(join(freshVault, ".quill-sessions"))).toBe(true);
+            expect(await pathExists(join(freshVault, "notes"))).toBe(true);
+            expect(await pathExists(join(freshVault, "tasks"))).toBe(true);
+            expect(await pathExists(join(freshVault, "daily"))).toBe(true);
+            expect(await pathExists(join(freshVault, "knowledge"))).toBe(true);
+            expect(await pathExists(join(freshVault, "canvases"))).toBe(true);
+
+            await rm(freshVault, { recursive: true, force: true });
+        });
+
+        it("should not fail when vault already exists with data", async () => {
+            await writeFile(join(TEST_VAULT, "existing.md"), "# hello");
+            const result = initVault();
+            expect(result).toBe(TEST_VAULT);
+            expect(await pathExists(join(TEST_VAULT, "existing.md"))).toBe(true);
+        });
+    });
 });

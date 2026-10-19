@@ -668,6 +668,19 @@ async function main() {
         // Continue without watcher — non-critical
     }
 
+    // Auto-generate hive canvas if missing
+    try {
+        const canvasPath = resolve(vaultPath, "canvases", "hive.canvas.tsx");
+        const { existsSync } = await import("node:fs");
+        if (!existsSync(canvasPath)) {
+            const { generateCanvas } = await import("./tools/generate-hive-canvas.js");
+            const result = await generateCanvas();
+            logger.info("Auto-generated hive canvas", { nodes: result.nodes, links: result.links, groups: result.groups });
+        }
+    } catch (err) {
+        logger.warn("Failed to auto-generate hive canvas", { error: err instanceof Error ? err.message : String(err) });
+    }
+
     // Initialize webhook manager with error handling
     try {
         await webhookManager.load();
